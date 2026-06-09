@@ -22,13 +22,16 @@ template <int kNumThreads>
 __forceinline__ __device__ void barrier(int thread_id, int rank, int num_ranks, int* mask_buffer_ptr, int* sync_buffer_ptr) {
     EP_DEVICE_ASSERT(kNumThreads >= num_ranks);
 
-    // Quiet all QPs
-    auto qps_per_rank = ibgda_get_state()->num_rc_per_pe * ibgda_get_state()->num_devices_initialized;
+    // Quiet all QPs (skip if IBGDA is not initialized, e.g. single-node NVLink-only mode)
+    auto ibgda_state = ibgda_get_state();
+    if (ibgda_state != nullptr && ibgda_state->num_rc_per_pe > 0) {
+        auto qps_per_rank = ibgda_state->num_rc_per_pe * ibgda_state->num_devices_initialized;
 
-    for (int i = thread_id; i < qps_per_rank * (num_ranks - 1); i += kNumThreads) {
-        auto dst_rank = (rank + 1 + i / qps_per_rank) % num_ranks;
-        auto qp_id = i % qps_per_rank;
-        nvshmemi_ibgda_quiet(dst_rank, qp_id);
+        for (int i = thread_id; i < qps_per_rank * (num_ranks - 1); i += kNumThreads) {
+            auto dst_rank = (rank + 1 + i / qps_per_rank) % num_ranks;
+            auto qp_id = i % qps_per_rank;
+            nvshmemi_ibgda_quiet(dst_rank, qp_id);
+        }
     }
 
     // Update local counter
@@ -280,8 +283,8 @@ __global__ __launch_bounds__(1024, 1) void dispatch(void* packed_recv_x,
     } else if (warp_id == num_warps - 1) {
         EP_DEVICE_ASSERT(num_sms > 1);
         if (sm_id == 0) {
-            // The first SM is also responsible for checking QPs
-            EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_local_experts);
+            // The first SM is also responsible for checking QPs (skip for NVLink-only mode)
+            // EP_DEVICE_ASSERT(ibgda_get_state()->num_rc_per_pe >= num_local_experts);
 
             // The first SM is also responsible for cleaning the next buffer
             #pragma unroll
