@@ -634,7 +634,8 @@ public:
                std::vector<int>,
                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-               std::optional<EventHandle>>
+               std::optional<EventHandle>,
+               std::optional<torch::Tensor>>
     dispatch(const torch::Tensor& x,
              const std::optional<torch::Tensor>& sf,
              const torch::Tensor& topk_idx,
@@ -1094,6 +1095,29 @@ public:
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
 
+        // Phase 1: copy recv_x into the symmetric memory expanded area at the end of buffer,
+        // so DeepGEMM can directly consume from symmetric memory (TMA compatibility validation).
+        // The expanded area sits right after the dispatch buffer region, which is idle after epilogue.
+        auto recv_x_sym = std::optional<torch::Tensor>();
+        if (do_expand and not do_cpu_sync) {
+            const auto dispatch_buf_size = get_dispatch_buffer_size(
+                num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
+                nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+                nccl_context->is_scaleup_nvlink);
+            EP_HOST_ASSERT(dispatch_buf_size + recv_x.nbytes() <= num_buffer_bytes);
+
+            auto* expanded_area_ptr = static_cast<uint8_t*>(static_cast<void*>(buffer)) + dispatch_buf_size;
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                expanded_area_ptr, recv_x.data_ptr(),
+                recv_x.nbytes(), cudaMemcpyDeviceToDevice, comm_stream));
+
+            // Wrap the symmetric memory pointer as a torch tensor (no ownership, lifetime tied to ElasticBuffer)
+            recv_x_sym = torch::from_blob(
+                expanded_area_ptr,
+                recv_x.sizes(),
+                recv_x.options());
+        }
+
         return {recv_x, recv_sf,
                 recv_topk_idx, recv_topk_weights,
                 copied_topk_idx,
@@ -1104,7 +1128,8 @@ public:
                 dst_buffer_slot_idx,
                 token_metadata_at_forward,
                 channel_linked_list,
-                event};
+                event,
+                recv_x_sym};
     }
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>

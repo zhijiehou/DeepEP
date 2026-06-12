@@ -772,7 +772,8 @@ class ElasticBuffer:
          dst_buffer_slot_idx,
          token_metadata_at_forward,
          channel_linked_list,
-         event) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
+         event,
+         recv_x_sym) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
                                         cumulative_local_expert_recv_stats,
                                         cached_num_recv_tokens,
                                         cached_num_recv_tokens_per_expert_list,
@@ -806,8 +807,8 @@ class ElasticBuffer:
         # Repack SF
         recv_x = (recv_x, recv_sf) if recv_sf is not None else recv_x
 
-        # Return
-        return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
+        # Return: recv_x_sym is the symmetric-memory copy of recv_x (do_expand=True, do_cpu_sync=False only)
+        return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event), recv_x_sym
 
     @staticmethod
     def _unpack_bias(bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) \
