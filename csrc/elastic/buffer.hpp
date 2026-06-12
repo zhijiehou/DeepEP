@@ -624,8 +624,14 @@ public:
             num_scaleout_ranks, num_scaleup_ranks,
             is_scaleup_nvlink, allow_multiple_reduction);
 
-        // Return the maximum of those layouts
-        return std::max(num_dispatch_bytes, num_combine_bytes);
+        // Return the maximum of those layouts, plus the expanded area for zero-copy dispatch
+        // expanded_area = worst-case num_expanded_tokens * hidden * elem_size (aligned to 256 bytes)
+        // This area sits at the end of the buffer, after dispatch/combine regions
+        const auto num_expanded_tokens_worst_case =
+            static_cast<int64_t>(num_scaleup_ranks) * num_scaleout_ranks * num_max_tokens_per_rank * num_topk;
+        const auto expanded_area_bytes = math::align(
+            num_expanded_tokens_worst_case * hidden * elem_size, 256);
+        return std::max(num_dispatch_bytes, num_combine_bytes) + expanded_area_bytes;
     }
 
     std::tuple<torch::Tensor, std::optional<torch::Tensor>,
