@@ -1125,11 +1125,6 @@ public:
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
 
-        // Phase 1: copy recv_x into the symmetric memory expanded area at the end of buffer,
-        // so DeepGEMM can directly consume from symmetric memory (TMA compatibility validation).
-        // The expanded area sits right after the dispatch buffer region, which is idle after epilogue.
-        // [SUPERSEDED BY Phase 2: epilogue now writes directly to expanded area via epilogue_recv_x_ptr]
-
         return {recv_x, recv_sf,
                 recv_topk_idx, recv_topk_weights,
                 copied_topk_idx,
