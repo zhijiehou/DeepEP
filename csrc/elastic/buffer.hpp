@@ -630,7 +630,7 @@ public:
         const auto num_expanded_tokens_worst_case =
             static_cast<int64_t>(num_scaleup_ranks) * num_scaleout_ranks * num_max_tokens_per_rank * num_topk;
         const auto expanded_area_bytes = math::align(
-            num_expanded_tokens_worst_case * hidden * elem_size, 256);
+            static_cast<int64_t>(num_expanded_tokens_worst_case * hidden * elem_size), static_cast<int64_t>(256));
         return std::max(num_dispatch_bytes, num_combine_bytes) + expanded_area_bytes;
     }
 
