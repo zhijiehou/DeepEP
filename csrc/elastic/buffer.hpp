@@ -1064,12 +1064,36 @@ public:
         }
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
+        // Phase 2: compute expanded_area_ptr before epilogue launch.
+        // do_expand=true: epilogue writes hidden directly into sym-mem expanded area (no D2D copy needed).
+        // The expanded area sits right after the dispatch buffer region, which is idle after epilogue.
+        auto recv_x_sym = std::optional<torch::Tensor>();
+        void* epilogue_recv_x_ptr = recv_x.data_ptr();
+        uint8_t* expanded_area_ptr = nullptr;
+        if (do_expand and not do_cpu_sync) {
+            const auto dispatch_buf_size = get_dispatch_buffer_size(
+                num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
+                nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+                nccl_context->is_scaleup_nvlink);
+            EP_HOST_ASSERT(dispatch_buf_size + recv_x.nbytes() <= num_buffer_bytes);
+
+            expanded_area_ptr = static_cast<uint8_t*>(static_cast<void*>(buffer)) + dispatch_buf_size;
+            // Redirect epilogue TMA store to write directly into sym-mem expanded area
+            epilogue_recv_x_ptr = expanded_area_ptr;
+
+            // Wrap the symmetric memory pointer as a torch tensor (no ownership, lifetime tied to ElasticBuffer)
+            recv_x_sym = torch::from_blob(
+                expanded_area_ptr,
+                recv_x.sizes(),
+                recv_x.options());
+        }
+
         // Launch copy kernels with full SMs
         stream_control_before_epilogue(previous_event_before_epilogue);
         launch_dispatch_copy_epilogue(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                                      recv_x.data_ptr(), recv_sf_ptr,
+                                      epilogue_recv_x_ptr, recv_sf_ptr,
                                       recv_topk_idx_ptr, recv_topk_weights_ptr,
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
@@ -1104,25 +1128,7 @@ public:
         // Phase 1: copy recv_x into the symmetric memory expanded area at the end of buffer,
         // so DeepGEMM can directly consume from symmetric memory (TMA compatibility validation).
         // The expanded area sits right after the dispatch buffer region, which is idle after epilogue.
-        auto recv_x_sym = std::optional<torch::Tensor>();
-        if (do_expand and not do_cpu_sync) {
-            const auto dispatch_buf_size = get_dispatch_buffer_size(
-                num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
-                nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
-                nccl_context->is_scaleup_nvlink);
-            EP_HOST_ASSERT(dispatch_buf_size + recv_x.nbytes() <= num_buffer_bytes);
-
-            auto* expanded_area_ptr = static_cast<uint8_t*>(static_cast<void*>(buffer)) + dispatch_buf_size;
-            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
-                expanded_area_ptr, recv_x.data_ptr(),
-                recv_x.nbytes(), cudaMemcpyDeviceToDevice, comm_stream));
-
-            // Wrap the symmetric memory pointer as a torch tensor (no ownership, lifetime tied to ElasticBuffer)
-            recv_x_sym = torch::from_blob(
-                expanded_area_ptr,
-                recv_x.sizes(),
-                recv_x.options());
-        }
+        // [SUPERSEDED BY Phase 2: epilogue now writes directly to expanded area via epilogue_recv_x_ptr]
 
         return {recv_x, recv_sf,
                 recv_topk_idx, recv_topk_weights,
