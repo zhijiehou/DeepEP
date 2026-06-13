@@ -1075,7 +1075,9 @@ public:
                 num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
                 nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
                 nccl_context->is_scaleup_nvlink);
-            EP_HOST_ASSERT(dispatch_buf_size + recv_x.nbytes() <= num_buffer_bytes);
+            // Verify expanded area fits: buffer = dispatch_buf + expanded_area, expanded_area >= recv_x
+            const auto expanded_area_bytes = num_buffer_bytes - static_cast<int64_t>(dispatch_buf_size);
+            EP_HOST_ASSERT(expanded_area_bytes >= static_cast<int64_t>(recv_x.nbytes()));
 
             expanded_area_ptr = static_cast<uint8_t*>(static_cast<void*>(buffer)) + dispatch_buf_size;
             // Redirect epilogue TMA store to write directly into sym-mem expanded area
