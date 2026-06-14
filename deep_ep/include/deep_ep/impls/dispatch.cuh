@@ -55,7 +55,12 @@ dispatch_impl(
     // Workspaces
     const auto workspace_layout = layout::WorkspaceLayout(workspace, 1, kNumRanks, kNumExperts);
     const auto host_workspace_layout = layout::WorkspaceLayout(mapped_host_workspace, 1, kNumRanks, kNumExperts);
-    if (sm_idx == 0 && thread_idx == 0) printf("[DBG] dispatch kernel started rank=%d expanded=%p worst=%d\n", rank_idx, expanded_area, worst_case_tokens_per_expert);
+    // DBG: write sentinel to host_workspace so CPU can detect kernel startup even if printf is unflushed
+    if (sm_idx == 0 && thread_idx == 0) {
+        printf("[DBG] dispatch kernel started rank=%d expanded=%p worst=%d\n", rank_idx, expanded_area, worst_case_tokens_per_expert);
+        __threadfence_system();
+        *static_cast<volatile int*>(mapped_host_workspace) = 0xDEADBEEF;
+    }
 
     // The kernel uses a fixed space of dynamic shared memory (no static shared memory)
     extern __shared__ __align__(ptx::kNumTMAAlignBytes) int8_t smem[];
