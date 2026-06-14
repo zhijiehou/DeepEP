@@ -1035,9 +1035,12 @@ public:
                 if (std::chrono::duration_cast<std::chrono::seconds>(now - start_cpu_time).count() > num_cpu_timeout_secs) {
                     // DBG: check if kernel wrote DEADBEEF sentinel
                     const auto sentinel = *static_cast<volatile int*>(mapped_host_workspace);
-                    fprintf(stderr, "[DBG-CPU] timeout: host_workspace[0]=0x%08X (DEADBEEF=%d)\n",
-                           (unsigned)sentinel, sentinel == (int)0xDEADBEEF);
-                    fflush(stderr);
+                    // Write to file so multiprocessing child output is captured
+                    if (FILE* f = fopen("/tmp/deepep_dbg.txt", "a")) {
+                        fprintf(f, "[DBG-CPU rank=%d] timeout: host_workspace[0]=0x%08X (DEADBEEF=%d)\n",
+                               nccl_context->scaleup_rank_idx, (unsigned)sentinel, sentinel == (int)0xDEADBEEF);
+                        fclose(f);
+                    }
                     throw EPExceptionWithLineInfo("Dispatch CPU wait", get_buffer_info());
                 }
             }
