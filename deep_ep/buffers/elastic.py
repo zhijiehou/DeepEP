@@ -837,7 +837,8 @@ class ElasticBuffer:
                              async_with_compute_stream: bool = False,
                              allocate_on_comm_stream: bool = False,
                              do_handle_copy: bool = True,
-                             use_tma_aligned_col_major_sf: bool = False) \
+                             use_tma_aligned_col_major_sf: bool = False,
+                             do_verify_copy: bool = False) \
             -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                      Optional[torch.Tensor], Optional[torch.Tensor],
                      EPHandle, EventOverlap, torch.Tensor]:
@@ -846,8 +847,14 @@ class ElasticBuffer:
         Always uses do_expand=True and do_cpu_sync=False.
         The expanded area is backed by NVSHMEM symmetric memory (buffer + dispatch_buf_size).
 
+        Args:
+            do_verify_copy: if True, recv_x is a normal GPU tensor (cudaMemcpy of expanded area),
+                safe for Python-side access and correctness verification. Default False (zero overhead,
+                recv_x is a sym-mem view same as recv_x_sym).
+
         Returns the same values as dispatch(), plus recv_x_sym as the 6th return value:
-            recv_x_sym: torch.Tensor view of the sym-mem expanded area (same data as recv_x).
+            recv_x_sym: torch.Tensor view of the sym-mem expanded area.
+            recv_x (when do_verify_copy=True): normal GPU tensor copy of expanded area for verification.
         """
         check_torch_deterministic()
 
@@ -883,7 +890,8 @@ class ElasticBuffer:
             previous_event_before_epilogue,
             async_with_compute_stream, allocate_on_comm_stream,
             do_handle_copy,
-            use_tma_aligned_col_major_sf)
+            use_tma_aligned_col_major_sf,
+            do_verify_copy)
 
         handle = EPHandle(True,  # do_expand=True
                           num_experts, expert_alignment,

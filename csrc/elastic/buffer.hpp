@@ -1176,7 +1176,8 @@ public:
                          const bool& async_with_compute_stream,
                          const bool& allocate_on_comm_stream,
                          const bool& do_handle_copy,
-                         const bool& use_tma_aligned_col_major_sf) const {
+                         const bool& use_tma_aligned_col_major_sf,
+                         const bool& do_verify_copy = false) const {
         // This path requires do_expand=true and no CPU sync (so we can compute worst-case expanded size statically)
         constexpr bool do_expand = true;
         constexpr bool do_cpu_sync = false;
@@ -1346,9 +1347,13 @@ public:
         EP_HOST_ASSERT(expanded_area_bytes >= required_bytes);
         uint8_t* expanded_area_ptr = static_cast<uint8_t*>(static_cast<void*>(buffer)) + dispatch_buf_size;
 
-        // recv_x and recv_x_sym both point to the same sym-mem expanded area
-        auto recv_x = torch::from_blob(expanded_area_ptr, {num_expanded_tokens, hidden}, x.options());
+        // recv_x_sym: sym-mem view of expanded area (zero-copy handle for downstream use)
         auto recv_x_sym = torch::from_blob(expanded_area_ptr, {num_expanded_tokens, hidden}, x.options());
+        // recv_x: when do_verify_copy=true, a normal GPU tensor filled via cudaMemcpyAsync after epilogue;
+        //         otherwise same sym-mem view (zero overhead in production)
+        auto recv_x = do_verify_copy
+            ? torch::empty({num_expanded_tokens, hidden}, x.options())
+            : torch::from_blob(expanded_area_ptr, {num_expanded_tokens, hidden}, x.options());
 
         // Optional output tensors (same as dispatch, do_expand=true path)
         auto recv_sf = std::optional<torch::Tensor>();
@@ -1404,6 +1409,15 @@ public:
                                       num_channels,
                                       do_expand, cached_mode,
                                       comm_stream);
+
+        // If verify copy is requested, copy expanded area → recv_x on the same comm_stream
+        // so the copy is ordered after epilogue writes (no extra sync needed).
+        if (do_verify_copy) {
+            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
+                recv_x.data_ptr(), expanded_area_ptr,
+                static_cast<size_t>(num_expanded_tokens) * hidden * x.element_size(),
+                cudaMemcpyDeviceToDevice, comm_stream));
+        }
 
         // Stream control
         const auto event = stream_control_epilogue(
@@ -1619,7 +1633,20 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
-        .def("dispatch_to_expanded", &ElasticBuffer::dispatch_to_expanded)
+        .def("dispatch_to_expanded", &ElasticBuffer::dispatch_to_expanded,
+             py::arg("x"), py::arg("sf"), py::arg("topk_idx"), py::arg("topk_weights"),
+             py::arg("cumulative_local_expert_recv_stats"),
+             py::arg("cached_num_recv_tokens"), py::arg("cached_num_recv_tokens_per_expert_list"),
+             py::arg("cached_psum_num_recv_tokens_per_scaleup_rank"),
+             py::arg("cached_psum_num_recv_tokens_per_expert"),
+             py::arg("cached_dst_buffer_slot_idx"), py::arg("cached_token_metadata_at_forward"),
+             py::arg("cached_channel_linked_list"),
+             py::arg("num_max_tokens_per_rank"), py::arg("num_experts"), py::arg("expert_alignment"),
+             py::arg("num_sms"), py::arg("num_qps"),
+             py::arg("previous_event"), py::arg("previous_event_before_epilogue"),
+             py::arg("async_with_compute_stream"), py::arg("allocate_on_comm_stream"),
+             py::arg("do_handle_copy"), py::arg("use_tma_aligned_col_major_sf"),
+             py::arg("do_verify_copy") = false)
         .def("combine", &ElasticBuffer::combine);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
     m.def("calculate_elastic_buffer_size_with_expanded", &ElasticBuffer::calculate_buffer_size_with_expanded);
