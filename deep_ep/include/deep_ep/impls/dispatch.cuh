@@ -391,28 +391,28 @@ dispatch_impl(
             ptx::tma_store_commit();
 
             // Phase 3: PUT hidden directly to expanded_area for each (token, expert) pair.
-            // Each topk lane independently computes its dst_row and issues a PUT.
-            // TMA requires elect_one_sync — we serialize across topk lanes using a loop on lane 0.
-            // For kNumTopk lanes, lane 0 iterates through each topk and does one TMA per iteration.
-            if (ptx::elect_one_sync() and expanded_area != nullptr) {
-                for (int k = 0; k < kNumTopk; ++k) {
-                    // Broadcast stored_dst_expanded_row and dst_expert_idx from lane k
-                    const int row = ptx::exchange(stored_dst_expanded_row, k);
-                    const int expert_idx = tma_buffer.get_topk_idx_ptr()[k];
-                    if (row >= 0 and expert_idx >= 0) {
-                        const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
-                        auto* expanded_row_ptr = math::advance_ptr<uint8_t>(
-                            static_cast<uint8_t*>(expanded_area),
-                            static_cast<int64_t>(row) * kNumHiddenBytes);
-                        const auto expanded_dst_ptr = gin.get_sym_ptr<team_t>(expanded_row_ptr, dst_rank_idx);
-                        if (expanded_dst_ptr != nullptr) {
-                            ptx::tma_store_1d(expanded_dst_ptr, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
-                            ptx::tma_store_commit();
-                        }
+            // TMA requires a single lane (elect_one). We iterate over kNumTopk slots;
+            // for each slot k, lane 0 reads row/expert_idx from lane k via shfl (all lanes participate),
+            // then only lane 0 issues the TMA store.
+            #pragma unroll
+            for (int k = 0; k < kNumTopk; ++k) {
+                // All lanes participate in shfl to broadcast lane k's values
+                const int row = __shfl_sync(0xffffffff, stored_dst_expanded_row, k);
+                const int expert_idx = (k < kNumTopk) ? tma_buffer.get_topk_idx_ptr()[k] : -1;
+                // Only lane 0 issues TMA
+                if (lane_idx == 0 and row >= 0 and expert_idx >= 0 and expanded_area != nullptr) {
+                    const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
+                    auto* expanded_row_ptr = math::advance_ptr<uint8_t>(
+                        static_cast<uint8_t*>(expanded_area),
+                        static_cast<int64_t>(row) * kNumHiddenBytes);
+                    const auto expanded_dst_ptr = gin.get_sym_ptr<team_t>(expanded_row_ptr, dst_rank_idx);
+                    if (expanded_dst_ptr != nullptr) {
+                        ptx::tma_store_1d(expanded_dst_ptr, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+                        ptx::tma_store_commit();
                     }
                 }
+                __syncwarp();
             }
-            __syncwarp();
 
             // Issue RDMA put (metadata only)
             if constexpr (not kIsScaleupNVLink) {
