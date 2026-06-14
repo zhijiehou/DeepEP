@@ -379,6 +379,7 @@ dispatch_impl(
             if (dst_ptr != nullptr)
                 ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
             ptx::tma_store_commit();
+            __syncwarp();
 
             // Phase 3: PUT hidden to expanded_area (disabled for debugging)
             // #pragma unroll
