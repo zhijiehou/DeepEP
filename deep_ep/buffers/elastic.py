@@ -264,6 +264,21 @@ class ElasticBuffer:
             allow_hybrid_mode, allow_multiple_reduction)
 
     @staticmethod
+    def get_buffer_size_hint_with_expanded(group: dist.ProcessGroup,
+                                           num_max_tokens_per_rank: int, hidden: int,
+                                           num_topk: int = 0, use_fp8_dispatch: bool = False,
+                                           allow_hybrid_mode: bool = True,
+                                           allow_multiple_reduction: bool = True) -> int:
+        """
+        Get buffer size (in bytes) that also reserves the sym-mem expanded area for dispatch_to_expanded().
+        Use this instead of get_buffer_size_hint() when you intend to call dispatch_to_expanded().
+        """
+        return _C.calculate_elastic_buffer_size_with_expanded(
+            get_nccl_comm_handle(group).get(),
+            num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
+            allow_hybrid_mode, allow_multiple_reduction)
+
+    @staticmethod
     def get_engram_storage_size_hint(num_entries: int, hidden: int,
                                      num_max_tokens_per_rank: int,
                                      dtype: torch.dtype = torch.bfloat16) -> int:
@@ -772,8 +787,7 @@ class ElasticBuffer:
          dst_buffer_slot_idx,
          token_metadata_at_forward,
          channel_linked_list,
-         event,
-         recv_x_sym) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
+         event) = self.runtime.dispatch(x, sf, topk_idx, topk_weights,
                                         cumulative_local_expert_recv_stats,
                                         cached_num_recv_tokens,
                                         cached_num_recv_tokens_per_expert_list,
@@ -807,7 +821,84 @@ class ElasticBuffer:
         # Repack SF
         recv_x = (recv_x, recv_sf) if recv_sf is not None else recv_x
 
-        # Return: recv_x_sym is the symmetric-memory copy of recv_x (do_expand=True, do_cpu_sync=False only)
+        return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
+
+    def dispatch_to_expanded(self,
+                             x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                             topk_idx: torch.Tensor,
+                             topk_weights: Optional[torch.Tensor] = None,
+                             cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                             num_experts: Optional[int] = None,
+                             num_max_tokens_per_rank: Optional[int] = None,
+                             expert_alignment: Optional[int] = None,
+                             num_sms: int = 0, num_qps: int = 0,
+                             previous_event: Optional[EventHandle] = None,
+                             previous_event_before_epilogue: Optional[EventHandle] = None,
+                             async_with_compute_stream: bool = False,
+                             allocate_on_comm_stream: bool = False,
+                             do_handle_copy: bool = True,
+                             use_tma_aligned_col_major_sf: bool = False) \
+            -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                     Optional[torch.Tensor], Optional[torch.Tensor],
+                     EPHandle, EventOverlap, torch.Tensor]:
+        """
+        Zero-copy dispatch: epilogue writes hidden directly into sym-mem expanded area.
+        Always uses do_expand=True and do_cpu_sync=False.
+        The expanded area is backed by NVSHMEM symmetric memory (buffer + dispatch_buf_size).
+
+        Returns the same values as dispatch(), plus recv_x_sym as the 6th return value:
+            recv_x_sym: torch.Tensor view of the sym-mem expanded area (same data as recv_x).
+        """
+        check_torch_deterministic()
+
+        num_topk = topk_idx.shape[1]
+        num_sms = self.get_theoretical_num_sms(num_experts, num_topk) if num_sms == 0 else num_sms
+        num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
+        assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
+
+        x, sf = x if isinstance(x, tuple) else (x, None)
+
+        num_max_tokens_per_rank = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
+        expert_alignment = value_or(expert_alignment, 1)
+
+        (recv_x, recv_sf,
+         recv_topk_idx, recv_topk_weights,
+         cloned_topk_idx,
+         num_recv_tokens_per_expert_list,
+         psum_num_recv_tokens_per_scaleup_rank,
+         psum_num_recv_tokens_per_expert,
+         recv_src_metadata,
+         dst_buffer_slot_idx,
+         token_metadata_at_forward,
+         channel_linked_list,
+         event,
+         recv_x_sym) = self.runtime.dispatch_to_expanded(
+            x, sf, topk_idx, topk_weights,
+            cumulative_local_expert_recv_stats,
+            None, None, None, None, None, None, None,  # no cached handles
+            num_max_tokens_per_rank,
+            num_experts, expert_alignment,
+            num_sms, num_qps,
+            previous_event,
+            previous_event_before_epilogue,
+            async_with_compute_stream, allocate_on_comm_stream,
+            do_handle_copy,
+            use_tma_aligned_col_major_sf)
+
+        handle = EPHandle(True,  # do_expand=True
+                          num_experts, expert_alignment,
+                          num_max_tokens_per_rank,
+                          num_sms,
+                          cloned_topk_idx if do_handle_copy else topk_idx,
+                          num_recv_tokens_per_expert_list,
+                          psum_num_recv_tokens_per_scaleup_rank,
+                          psum_num_recv_tokens_per_expert,
+                          recv_src_metadata,
+                          dst_buffer_slot_idx,
+                          token_metadata_at_forward,
+                          channel_linked_list)
+
+        recv_x = (recv_x, recv_sf) if recv_sf is not None else recv_x
         return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event), recv_x_sym
 
     @staticmethod

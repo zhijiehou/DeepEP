@@ -624,13 +624,42 @@ public:
             num_scaleout_ranks, num_scaleup_ranks,
             is_scaleup_nvlink, allow_multiple_reduction);
 
-        // Return the maximum of those layouts, plus the expanded area for zero-copy dispatch
-        // expanded_area = worst-case num_expanded_tokens * hidden * elem_size (aligned to 256 bytes)
-        // This area sits at the end of the buffer, after dispatch/combine regions
+        return std::max(num_dispatch_bytes, num_combine_bytes);
+    }
+
+    // Buffer size for dispatch_to_expanded: adds the expanded area after dispatch/combine regions.
+    // Use this instead of calculate_buffer_size when you intend to call dispatch_to_expanded().
+    static int64_t calculate_buffer_size_with_expanded(const int64_t& nccl_comm,
+                                                       const int& num_max_tokens_per_rank, const int& hidden,
+                                                       int num_topk, const bool& use_fp8_dispatch,
+                                                       const bool& allow_hybrid_mode,
+                                                       const bool& allow_multiple_reduction) {
+        EP_HOST_ASSERT(num_max_tokens_per_rank > 0 and hidden > 0);
+        EP_HOST_ASSERT(math::ceil_div(hidden, 32) * sizeof(float) <= hidden);
+        num_topk = num_topk == 0 ? 32 : num_topk;
+
+        const auto [num_rdma_ranks, num_nvl_ranks] = nccl::get_physical_domain_size(nccl_comm);
+        const auto [num_scaleout_ranks, num_scaleup_ranks] = nccl::get_logical_domain_size(nccl_comm, allow_hybrid_mode);
+        const auto is_scaleup_nvlink = num_scaleup_ranks == num_nvl_ranks;
+
+        const auto elem_size = use_fp8_dispatch ? sizeof(__nv_fp8_e4m3) : sizeof(nv_bfloat16);
+        const auto num_sf_packs = use_fp8_dispatch ? math::ceil_div(hidden, 32) : 0;
+        const auto num_dispatch_bytes = get_dispatch_buffer_size(
+            num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, elem_size,
+            num_scaleout_ranks, num_scaleup_ranks, is_scaleup_nvlink);
+        const auto num_combine_bytes = get_combine_buffer_size(
+            num_max_tokens_per_rank, hidden, num_topk,
+            num_scaleout_ranks, num_scaleup_ranks,
+            is_scaleup_nvlink, allow_multiple_reduction);
+
+        // Expanded area: worst-case expanded tokens * hidden * elem_size, 256-byte aligned.
+        // Sits after the dispatch region (which is idle once epilogue is done).
         const auto num_expanded_tokens_worst_case =
             static_cast<int64_t>(num_scaleup_ranks) * num_scaleout_ranks * num_max_tokens_per_rank * num_topk;
         const auto expanded_area_bytes = math::align(
-            static_cast<int64_t>(num_expanded_tokens_worst_case * hidden * elem_size), static_cast<int64_t>(256));
+            static_cast<int64_t>(num_expanded_tokens_worst_case * hidden * elem_size),
+            static_cast<int64_t>(256));
+
         return std::max(num_dispatch_bytes, num_combine_bytes) + expanded_area_bytes;
     }
 
@@ -640,8 +669,7 @@ public:
                std::vector<int>,
                torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
-               std::optional<EventHandle>,
-               std::optional<torch::Tensor>>
+               std::optional<EventHandle>>
     dispatch(const torch::Tensor& x,
              const std::optional<torch::Tensor>& sf,
              const torch::Tensor& topk_idx,
@@ -1064,39 +1092,305 @@ public:
         }
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
 
-        // Phase 2: compute expanded_area_ptr before epilogue launch.
-        // do_expand=true: epilogue writes hidden directly into sym-mem expanded area (no D2D copy needed).
-        // The expanded area sits right after the dispatch buffer region, which is idle after epilogue.
-        auto recv_x_sym = std::optional<torch::Tensor>();
-        void* epilogue_recv_x_ptr = recv_x.data_ptr();
-        uint8_t* expanded_area_ptr = nullptr;
-        if (do_expand and not do_cpu_sync) {
-            const auto dispatch_buf_size = get_dispatch_buffer_size(
-                num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
-                nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
-                nccl_context->is_scaleup_nvlink);
-            // Verify expanded area fits: buffer = dispatch_buf + expanded_area, expanded_area >= recv_x
-            const auto expanded_area_bytes = num_buffer_bytes - static_cast<int64_t>(dispatch_buf_size);
-            EP_HOST_ASSERT(expanded_area_bytes >= static_cast<int64_t>(recv_x.nbytes()));
-
-            expanded_area_ptr = static_cast<uint8_t*>(static_cast<void*>(buffer)) + dispatch_buf_size;
-            // Redirect epilogue TMA store to write directly into sym-mem expanded area
-            epilogue_recv_x_ptr = expanded_area_ptr;
-
-            // Wrap the symmetric memory pointer as a torch tensor (no ownership, lifetime tied to ElasticBuffer)
-            recv_x_sym = torch::from_blob(
-                expanded_area_ptr,
-                recv_x.sizes(),
-                recv_x.options());
-        }
-
         // Launch copy kernels with full SMs
         stream_control_before_epilogue(previous_event_before_epilogue);
         launch_dispatch_copy_epilogue(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                                      epilogue_recv_x_ptr, recv_sf_ptr,
+                                      recv_x.data_ptr(), recv_sf_ptr,
                                       recv_topk_idx_ptr, recv_topk_weights_ptr,
+                                      recv_src_metadata.data_ptr<int>(),
+                                      channel_linked_list_ptr,
+                                      num_recv_tokens, num_max_tokens_per_rank,
+                                      num_hidden_bytes,
+                                      num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,
+                                      num_experts, num_topk,
+                                      nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
+                                      nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+                                      jit::device_runtime->get_num_sms(),
+                                      jit::device_runtime->get_num_smem_bytes(),
+                                      num_channels,
+                                      do_expand, cached_mode,
+                                      comm_stream);
+
+        // Stream control
+        const auto event = stream_control_epilogue(
+            {x, sf, topk_idx, topk_weights,
+             recv_x, recv_sf, recv_topk_idx, recv_topk_weights,
+             cumulative_local_expert_recv_stats,
+             copied_topk_idx,
+             psum_num_recv_tokens_per_scaleup_rank,
+             psum_num_recv_tokens_per_expert,
+             recv_src_metadata,
+             deterministic_rank_count_buffer,
+             dst_buffer_slot_idx,
+             token_metadata_at_forward,
+             channel_linked_list},
+            compute_stream,
+            allocate_on_comm_stream, async_with_compute_stream);
+
+        return {recv_x, recv_sf,
+                recv_topk_idx, recv_topk_weights,
+                copied_topk_idx,
+                num_recv_tokens_per_expert_list,
+                psum_num_recv_tokens_per_scaleup_rank,
+                psum_num_recv_tokens_per_expert,
+                recv_src_metadata,
+                dst_buffer_slot_idx,
+                token_metadata_at_forward,
+                channel_linked_list,
+                event};
+    }
+
+    // Zero-copy dispatch: epilogue writes hidden directly into sym-mem expanded area.
+    // This is a standalone function that does NOT touch the original dispatch() at all.
+    // Differences from dispatch():
+    //   - Always do_expand=true, do_cpu_sync=false (asserted)
+    //   - recv_x is backed by sym-mem expanded area (buffer + dispatch_buf_size), no separate allocation
+    //   - Returns an extra recv_x_sym (torch::from_blob view of the expanded area)
+    std::tuple<torch::Tensor, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<torch::Tensor>,
+               std::vector<int>,
+               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               std::optional<torch::Tensor>, std::optional<torch::Tensor>,
+               std::optional<EventHandle>,
+               torch::Tensor>
+    dispatch_to_expanded(const torch::Tensor& x,
+                         const std::optional<torch::Tensor>& sf,
+                         const torch::Tensor& topk_idx,
+                         const std::optional<torch::Tensor>& topk_weights,
+                         const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+                         const std::optional<int>& cached_num_recv_tokens,
+                         const std::optional<std::vector<int>>& cached_num_recv_tokens_per_expert_list,
+                         const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_scaleup_rank,
+                         const std::optional<torch::Tensor>& cached_psum_num_recv_tokens_per_expert,
+                         const std::optional<torch::Tensor>& cached_dst_buffer_slot_idx,
+                         const std::optional<torch::Tensor>& cached_token_metadata_at_forward,
+                         const std::optional<torch::Tensor>& cached_channel_linked_list,
+                         const int& num_max_tokens_per_rank,
+                         const int& num_experts, const int& expert_alignment,
+                         const int& num_sms, const int& num_qps,
+                         const std::optional<EventHandle>& previous_event,
+                         const std::optional<EventHandle>& previous_event_before_epilogue,
+                         const bool& async_with_compute_stream,
+                         const bool& allocate_on_comm_stream,
+                         const bool& do_handle_copy,
+                         const bool& use_tma_aligned_col_major_sf) const {
+        // This path requires do_expand=true and no CPU sync (so we can compute worst-case expanded size statically)
+        constexpr bool do_expand = true;
+        constexpr bool do_cpu_sync = false;
+        constexpr bool cached_mode = false;
+
+        // Check SM count
+        EP_HOST_ASSERT(num_sms > 0);
+
+        // Check data tensor
+        const auto [num_tokens, hidden] = get_shape<2>(x);
+        const auto num_hidden_bytes = hidden * static_cast<int>(x.element_size());
+        const auto num_local_experts = num_experts / nccl_context->num_ranks;
+        EP_HOST_ASSERT(x.is_cuda() and x.is_contiguous());
+        EP_HOST_ASSERT((x.size(1) * x.element_size()) % sizeof(int4) == 0);
+        EP_HOST_ASSERT(num_tokens <= num_max_tokens_per_rank);
+
+        // Check SF stuffs
+        int num_sf_packs = 0;
+        void* sf_ptr = nullptr;
+        int sf_token_stride = 0, sf_hidden_stride = 0;
+        if (sf.has_value()) {
+            const auto [num_tokens_, num_sf_packs_] = get_shape<2>(sf.value());
+            EP_HOST_ASSERT(num_tokens == num_tokens_);
+            EP_HOST_ASSERT(sf->is_cuda());
+            EP_HOST_ASSERT(sf->element_size() == sizeof(sf_pack_t));
+            num_sf_packs = num_sf_packs_;
+            sf_ptr = sf->data_ptr();
+            sf_token_stride = sf->stride(0);
+            sf_hidden_stride = sf->stride(1);
+        }
+
+        // Check top-k stuffs
+        const auto [num_tokens_, num_topk] = get_shape<2>(topk_idx);
+        EP_HOST_ASSERT(num_tokens == num_tokens_);
+        EP_HOST_ASSERT(topk_idx.scalar_type() == c10::CppTypeToScalarType<topk_idx_t>::value);
+        EP_HOST_ASSERT(topk_idx.is_cuda() and topk_idx.is_contiguous());
+
+        // Weights are optional for training backward
+        float* topk_weights_ptr = nullptr;
+        if (topk_weights.has_value()) {
+            const auto [num_tokens__, num_topk_] = get_shape<2>(topk_weights.value());
+            EP_HOST_ASSERT(num_tokens == num_tokens__);
+            EP_HOST_ASSERT(topk_weights->is_cuda() and topk_weights->is_contiguous());
+            topk_weights_ptr = topk_weights->data_ptr<float>();
+        }
+
+        // Expert receiving counter
+        int* cumulative_local_expert_recv_stats_ptr = nullptr;
+        if (cumulative_local_expert_recv_stats.has_value()) {
+            const auto [num_local_experts_] = get_shape<1>(cumulative_local_expert_recv_stats.value());
+            EP_HOST_ASSERT(cumulative_local_expert_recv_stats->is_cuda() and
+                           cumulative_local_expert_recv_stats->is_contiguous());
+            EP_HOST_ASSERT(num_local_experts == num_local_experts_);
+            cumulative_local_expert_recv_stats_ptr = cumulative_local_expert_recv_stats->data_ptr<int>();
+        }
+
+        // Stream control
+        const auto compute_stream = stream_control_prologue(previous_event, allocate_on_comm_stream, async_with_compute_stream);
+
+        // Prefix sum tensors (always fresh, no cached mode)
+        EP_HOST_ASSERT(num_experts % nccl_context->num_ranks == 0);
+        auto psum_num_recv_tokens_per_expert = torch::empty(
+            {num_local_experts + 1}, at::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+        auto psum_num_recv_tokens_per_scaleup_rank = torch::empty(
+            {nccl_context->num_scaleup_ranks}, at::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+
+        // Decide number of channels (same logic as dispatch)
+        int num_channels_per_sm = 1, num_channels = 1;
+        const int num_smem_bytes = jit::device_runtime->get_num_smem_bytes();
+        if (nccl_context->num_scaleout_ranks > 1) {
+            const auto dispatch_token_layout = get_dispatch_token_layout(hidden, x.element_size(), num_sf_packs, num_topk);
+            const auto combine_token_layout = get_combine_token_layout(hidden, sizeof(nv_bfloat16), num_topk);
+            EP_HOST_ASSERT(num_sms <= kNumMaxSMs);
+            num_channels_per_sm = std::min<int>(
+                (num_smem_bytes - get_num_notify_smem_bytes(nccl_context->num_ranks, num_experts)) / dispatch_token_layout.get_num_bytes<true>(),
+                32 - kNumNotifyWarps);
+            num_channels_per_sm = std::min<int>(
+                num_smem_bytes / combine_token_layout.get_num_bytes<true>(),
+                num_channels_per_sm);
+            num_channels_per_sm = std::min<int>(num_channels_per_sm / 2, kNumMaxChannelsPerSM);
+            if (not prefer_overlap_with_compute)
+                num_channels_per_sm = std::min<int>(num_channels_per_sm, 4);
+            num_channels = num_sms * num_channels_per_sm;
+        }
+
+        // Non-hybrid mode handles (no cached mode, no deterministic for this path)
+        std::optional<torch::Tensor> deterministic_rank_count_buffer = std::nullopt;
+        auto dst_buffer_slot_idx = torch::empty(
+            {num_tokens, num_topk}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+
+        // Token metadata for forward (only for hybrid mode)
+        auto token_metadata_at_forward = std::optional<torch::Tensor>();
+        int* token_metadata_at_forward_ptr = nullptr;
+        auto channel_linked_list = std::optional<torch::Tensor>();
+        int* channel_linked_list_ptr = nullptr;
+        if (nccl_context->num_scaleout_ranks > 1) {
+            token_metadata_at_forward = torch::empty(
+                {num_tokens * num_topk}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            token_metadata_at_forward_ptr = token_metadata_at_forward->data_ptr<int>();
+            channel_linked_list = torch::empty(
+                {num_channels + 1}, torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+            channel_linked_list_ptr = channel_linked_list->data_ptr<int>();
+        }
+
+        // Copied topk_idx handle
+        auto copied_topk_idx = std::optional<torch::Tensor>();
+        topk_idx_t* copied_topk_idx_ptr = nullptr;
+        if (do_handle_copy) {
+            copied_topk_idx = torch::empty_like(topk_idx);
+            copied_topk_idx_ptr = copied_topk_idx->data_ptr<topk_idx_t>();
+        }
+
+        // Check buffer size
+        const auto dispatch_buf_size = get_dispatch_buffer_size(
+            num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, x.element_size(),
+            nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+            nccl_context->is_scaleup_nvlink);
+        EP_HOST_ASSERT(static_cast<int64_t>(dispatch_buf_size) <= num_buffer_bytes);
+
+        // Prepare host workspace
+        const auto host_workspace_layout = layout::WorkspaceLayout(
+            host_workspace,
+            nccl_context->num_scaleout_ranks,
+            nccl_context->num_scaleup_ranks,
+            num_experts);
+        std::fill_n(host_workspace_layout.get_scaleup_rank_count_ptr<false>(), nccl_context->num_scaleup_ranks, 0);
+        std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+
+        // Do dispatch into the buffers
+        EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
+        launch_dispatch(x.data_ptr(), sf_ptr,
+                        topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
+                        copied_topk_idx_ptr,
+                        cumulative_local_expert_recv_stats_ptr,
+                        psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                        psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                        dst_buffer_slot_idx.data_ptr<int>(),
+                        token_metadata_at_forward_ptr,
+                        num_tokens, num_max_tokens_per_rank,
+                        hidden, x.element_size(),
+                        num_sf_packs, sf_token_stride, sf_hidden_stride,
+                        num_experts, num_topk, expert_alignment,
+                        nccl_context->dev_comm, nccl_context->window,
+                        buffer,
+                        workspace, mapped_host_workspace,
+                        nccl_context->scaleout_rank_idx, nccl_context->scaleup_rank_idx,
+                        nccl_context->num_scaleout_ranks, nccl_context->num_scaleup_ranks,
+                        nccl_context->is_scaleup_nvlink,
+                        num_sms, num_channels_per_sm,
+                        num_smem_bytes,
+                        num_qps, num_gpu_timeout_cycles,
+                        cached_mode, deterministic, do_cpu_sync,
+                        comm_stream);
+
+        // Without CPU sync: allocate with worst-case expanded token count
+        const int num_expanded_tokens_worst = nccl_context->num_ranks * num_max_tokens_per_rank * std::min(num_topk, num_local_experts)
+            + (expert_alignment - 1) * num_local_experts;
+        const int num_expanded_tokens = math::align(num_expanded_tokens_worst, expert_alignment);
+        const std::vector<int> num_recv_tokens_per_expert_list;  // empty in async path
+
+        // --- Key difference from dispatch(): recv_x is backed by sym-mem expanded area ---
+        // The expanded area sits right after the dispatch buffer region (which is idle after epilogue).
+        // We verify it can hold num_expanded_tokens rows of hidden, then wrap it as a torch tensor.
+        const auto expanded_area_bytes = num_buffer_bytes - static_cast<int64_t>(dispatch_buf_size);
+        const auto required_bytes = static_cast<int64_t>(num_expanded_tokens) * hidden * static_cast<int64_t>(x.element_size());
+        EP_HOST_ASSERT(expanded_area_bytes >= required_bytes);
+        uint8_t* expanded_area_ptr = static_cast<uint8_t*>(static_cast<void*>(buffer)) + dispatch_buf_size;
+
+        // recv_x and recv_x_sym both point to the same sym-mem expanded area
+        auto recv_x = torch::from_blob(expanded_area_ptr, {num_expanded_tokens, hidden}, x.options());
+        auto recv_x_sym = torch::from_blob(expanded_area_ptr, {num_expanded_tokens, hidden}, x.options());
+
+        // Optional output tensors (same as dispatch, do_expand=true path)
+        auto recv_sf = std::optional<torch::Tensor>();
+        auto recv_topk_idx = std::optional<torch::Tensor>();  // always null in expand mode
+        auto recv_topk_weights = std::optional<torch::Tensor>();
+        auto recv_src_metadata = torch::empty(
+            {num_expanded_tokens, num_topk + 2},
+            torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
+
+        void* recv_sf_ptr = nullptr;
+        float* recv_topk_weights_ptr = nullptr;
+        int recv_sf_token_stride = 0, recv_sf_hidden_stride = 0;
+        if (sf.has_value()) {
+            if (not use_tma_aligned_col_major_sf) {
+                recv_sf_token_stride = num_sf_packs, recv_sf_hidden_stride = 1;
+            } else {
+                recv_sf_token_stride = 1, recv_sf_hidden_stride = math::align(num_expanded_tokens, kNumAlignedSFPacks);
+            }
+            recv_sf = torch::empty_strided({num_expanded_tokens, num_sf_packs},
+                                           {recv_sf_token_stride, recv_sf_hidden_stride},
+                                           sf->options());
+            recv_sf_ptr = recv_sf->data_ptr();
+        }
+        if (topk_weights.has_value()) {
+            recv_topk_weights = torch::empty({num_expanded_tokens}, topk_weights->options());
+            recv_topk_weights_ptr = recv_topk_weights->data_ptr<float>();
+        }
+
+        // Prefix sum for expand mode: slice exclusive part for atomic additions
+        psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert.slice(0, 0, num_local_experts);
+        EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
+
+        // num_recv_tokens for epilogue = worst-case non-expanded recv count
+        const int num_recv_tokens = num_max_tokens_per_rank * nccl_context->num_ranks;
+
+        // Launch epilogue: writes hidden directly into expanded_area_ptr (sym-mem)
+        stream_control_before_epilogue(previous_event_before_epilogue);
+        launch_dispatch_copy_epilogue(buffer, workspace,
+                                      psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
+                                      psum_num_recv_tokens_per_expert.data_ptr<int>(),
+                                      expanded_area_ptr, recv_sf_ptr,
+                                      nullptr, recv_topk_weights_ptr,
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
                                       num_recv_tokens, num_max_tokens_per_rank,
@@ -1325,8 +1619,10 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
+        .def("dispatch_to_expanded", &ElasticBuffer::dispatch_to_expanded)
         .def("combine", &ElasticBuffer::combine);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
+    m.def("calculate_elastic_buffer_size_with_expanded", &ElasticBuffer::calculate_buffer_size_with_expanded);
 
     // NCCL communicator handle
     m.def("get_local_nccl_unique_id", &nccl::get_local_unique_id);
