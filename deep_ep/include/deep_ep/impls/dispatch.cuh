@@ -353,10 +353,9 @@ dispatch_impl(
             }
 
             // Phase 3: Per-expert expanded row allocation via atomicAdd
-            // Each lane handles one topk slot; if the destination is local (rank_idx), it
-            // atomics into per_expert_counter to claim a row in expanded_area.
+            // Only active when expanded_area is provided (dispatch_to_expanded path).
             int stored_dst_expanded_row = -1;
-            if (lane_idx < kNumTopk) {
+            if (expanded_area != nullptr and lane_idx < kNumTopk) {
                 const int dst_expert_idx = tma_buffer.get_topk_idx_ptr()[lane_idx];
                 if (dst_expert_idx >= 0 and dst_expert_idx / kNumExpertsPerRank == rank_idx) {
                     const int local_expert_idx = dst_expert_idx - rank_idx * kNumExpertsPerRank;
