@@ -352,10 +352,19 @@ dispatch_impl(
                 }
             }
 
-            // Phase 3: Per-expert expanded row allocation (disabled for debugging)
+            // Phase 3: Per-expert expanded row allocation via atomicAdd
+            // Each lane handles one topk slot; if the destination is local (rank_idx), it
+            // atomics into per_expert_counter to claim a row in expanded_area.
             int stored_dst_expanded_row = -1;
-            (void)stored_dst_expanded_row;
-            (void)worst_case_tokens_per_expert;
+            if (lane_idx < kNumTopk) {
+                const int dst_expert_idx = tma_buffer.get_topk_idx_ptr()[lane_idx];
+                if (dst_expert_idx >= 0 and dst_expert_idx / kNumExpertsPerRank == rank_idx) {
+                    const int local_expert_idx = dst_expert_idx - rank_idx * kNumExpertsPerRank;
+                    int* counter_ptr = workspace_layout.get_per_expert_counter() + local_expert_idx;
+                    const int local_row = atomicAdd(counter_ptr, 1);
+                    stored_dst_expanded_row = local_expert_idx * worst_case_tokens_per_expert + local_row;
+                }
+            }
             __syncwarp();
 
             // Wait TMA load arrival
@@ -387,9 +396,19 @@ dispatch_impl(
             ptx::tma_store_commit();
             __syncwarp();
 
-            // Phase 3: PUT hidden to expanded_area (disabled for debugging)
-            // #pragma unroll
-            // for (int k = 0; k < kNumTopk; ++k) { ... }
+            // Phase 3: PUT hidden to expanded_area directly (local expert rows only)
+            // Each lane that has a valid dst_expanded_row writes kNumHiddenBytes to the
+            // pre-allocated sym-mem row. No RDMA needed — this is purely local write.
+            if (stored_dst_expanded_row >= 0) {
+                auto* dst_expanded_ptr = math::advance_ptr<int8_t>(
+                    expanded_area, static_cast<int64_t>(stored_dst_expanded_row) * kNumHiddenBytes);
+                const auto* src_hidden_ptr = tma_buffer.get_hidden_ptr();
+                // Vectorized copy: kNumHiddenBytes must be multiple of 16 (guaranteed by caller assert)
+                constexpr int kNumInt4 = kNumHiddenBytes / sizeof(int4);
+                #pragma unroll
+                for (int i = 0; i < kNumInt4; ++i)
+                    reinterpret_cast<int4*>(dst_expanded_ptr)[i] = reinterpret_cast<const int4*>(src_hidden_ptr)[i];
+            }
 
             // Issue RDMA put (metadata only)
             if constexpr (not kIsScaleupNVLink) {
