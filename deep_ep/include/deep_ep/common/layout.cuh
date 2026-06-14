@@ -76,9 +76,9 @@ struct WorkspaceLayout {
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
-        // Phase 3: per-expert atomic counter for direct expanded PUT
-        // Dispatch warp uses this to compute expanded row index without going through epilogue
-        num_bytes += kNumMaxExperts * sizeof(int);
+        // Phase 3: per-expert atomic counter - NOTE: temporarily excluded from get_num_bytes()
+        // to test if workspace size change is the root cause of dispatch timeout
+        // num_bytes += kNumMaxExperts * sizeof(int);
 
         // Ensure LDG.256 work
         return math::align<int64_t>(num_bytes, 32);
