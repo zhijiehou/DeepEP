@@ -1359,8 +1359,10 @@ public:
         auto recv_sf = std::optional<torch::Tensor>();
         auto recv_topk_idx = std::optional<torch::Tensor>();  // always null in expand mode
         auto recv_topk_weights = std::optional<torch::Tensor>();
+        // recv_src_metadata: one row per received token (worst-case = all ranks * max_tokens_per_rank)
+        const int num_recv_tokens_worst = num_max_tokens_per_rank * nccl_context->num_ranks;
         auto recv_src_metadata = torch::empty(
-            {num_recv_tokens, num_topk + 2},
+            {num_recv_tokens_worst, num_topk + 2},
             torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
 
         void* recv_sf_ptr = nullptr;
