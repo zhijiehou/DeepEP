@@ -631,7 +631,8 @@ public:
     // Use this instead of calculate_buffer_size when you intend to call dispatch_to_expanded().
     static int64_t calculate_buffer_size_with_expanded(const int64_t& nccl_comm,
                                                        const int& num_max_tokens_per_rank, const int& hidden,
-                                                       int num_topk, const bool& use_fp8_dispatch,
+                                                       int num_topk, const int& num_experts,
+                                                       const bool& use_fp8_dispatch,
                                                        const bool& allow_hybrid_mode,
                                                        const bool& allow_multiple_reduction) {
         EP_HOST_ASSERT(num_max_tokens_per_rank > 0 and hidden > 0);
@@ -652,10 +653,15 @@ public:
             num_scaleout_ranks, num_scaleup_ranks,
             is_scaleup_nvlink, allow_multiple_reduction);
 
-        // Expanded area: worst-case expanded tokens * hidden * elem_size, 256-byte aligned.
-        // Sits after the dispatch region (which is idle once epilogue is done).
-        const auto num_expanded_tokens_worst_case =
-            static_cast<int64_t>(num_scaleup_ranks) * num_scaleout_ranks * num_max_tokens_per_rank * num_topk;
+        // Expanded area: formula must match dispatch_to_expanded exactly (expert_alignment=1).
+        // worst_case_per_expert = num_ranks * num_max * min(topk, local_experts)
+        // num_expanded_tokens = worst_case_per_expert * num_local_experts
+        const int64_t num_ranks = static_cast<int64_t>(num_scaleup_ranks) * num_scaleout_ranks;
+        EP_HOST_ASSERT(num_experts > 0 and num_experts % num_ranks == 0);
+        const int64_t num_local_experts = num_experts / num_ranks;
+        const int64_t worst_case_per_expert =
+            num_ranks * num_max_tokens_per_rank * std::min<int64_t>(num_topk, num_local_experts);
+        const int64_t num_expanded_tokens_worst_case = worst_case_per_expert * num_local_experts;
         const auto expanded_area_bytes = math::align(
             static_cast<int64_t>(num_expanded_tokens_worst_case * hidden * elem_size),
             static_cast<int64_t>(256));

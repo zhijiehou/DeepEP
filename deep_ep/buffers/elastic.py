@@ -266,16 +266,21 @@ class ElasticBuffer:
     @staticmethod
     def get_buffer_size_hint_with_expanded(group: dist.ProcessGroup,
                                            num_max_tokens_per_rank: int, hidden: int,
-                                           num_topk: int = 0, use_fp8_dispatch: bool = False,
+                                           num_topk: int = 0, num_experts: int = 0,
+                                           use_fp8_dispatch: bool = False,
                                            allow_hybrid_mode: bool = True,
                                            allow_multiple_reduction: bool = True) -> int:
         """
         Get buffer size (in bytes) that also reserves the sym-mem expanded area for dispatch_to_expanded().
         Use this instead of get_buffer_size_hint() when you intend to call dispatch_to_expanded().
+
+        Arguments:
+            num_experts: total number of experts across all ranks (required for correct expanded area sizing).
         """
+        assert num_experts > 0, "num_experts must be provided and > 0 for dispatch_to_expanded"
         return _C.calculate_elastic_buffer_size_with_expanded(
             get_nccl_comm_handle(group).get(),
-            num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
+            num_max_tokens_per_rank, hidden, num_topk, num_experts, use_fp8_dispatch,
             allow_hybrid_mode, allow_multiple_reduction)
 
     @staticmethod
