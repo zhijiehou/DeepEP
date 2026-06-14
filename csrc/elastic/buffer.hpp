@@ -1032,8 +1032,13 @@ public:
 
                 // Timeout checks
                 const auto now = std::chrono::high_resolution_clock::now();
-                if (std::chrono::duration_cast<std::chrono::seconds>(now - start_cpu_time).count() > num_cpu_timeout_secs)
+                if (std::chrono::duration_cast<std::chrono::seconds>(now - start_cpu_time).count() > num_cpu_timeout_secs) {
+                    // DBG: check if kernel wrote DEADBEEF sentinel
+                    const auto sentinel = *static_cast<volatile int*>(mapped_host_workspace);
+                    printf("[DBG-CPU] timeout: host_workspace[0]=0x%08X (DEADBEEF=%d)\n",
+                           (unsigned)sentinel, sentinel == (int)0xDEADBEEF);
                     throw EPExceptionWithLineInfo("Dispatch CPU wait", get_buffer_info());
+                }
             }
         } else {
             // Non-cached mode without CPU sync, allocate with the worst case
