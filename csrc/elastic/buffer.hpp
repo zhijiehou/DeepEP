@@ -955,6 +955,7 @@ public:
                         psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                         psum_num_recv_tokens_per_expert.data_ptr<int>(),
                         dst_buffer_slot_idx.data_ptr<int>(),
+                        nullptr, 0,
                         token_metadata_at_forward_ptr,
                         num_tokens, num_max_tokens_per_rank,
                         hidden, x.element_size(),
@@ -1111,6 +1112,7 @@ public:
                                       jit::device_runtime->get_num_smem_bytes(),
                                       num_channels,
                                       do_expand, cached_mode,
+                                      0,
                                       comm_stream);
 
         // Stream control
@@ -1412,15 +1414,6 @@ public:
                                       worst_case_tokens_per_expert,
                                       comm_stream);
 
-        // If verify copy is requested, copy expanded area → recv_x on the same comm_stream
-        // so the copy is ordered after epilogue writes (no extra sync needed).
-        if (do_verify_copy) {
-            CUDA_RUNTIME_CHECK(cudaMemcpyAsync(
-                recv_x.data_ptr(), expanded_area_ptr,
-                static_cast<size_t>(num_expanded_tokens) * hidden * x.element_size(),
-                cudaMemcpyDeviceToDevice, comm_stream));
-        }
-
         // Stream control
         const auto event = stream_control_epilogue(
             {x, sf, topk_idx, topk_weights,
@@ -1437,6 +1430,7 @@ public:
             compute_stream,
             allocate_on_comm_stream, async_with_compute_stream);
 
+        const std::vector<int> num_recv_tokens_per_expert_list;  // empty in async path
         return {recv_x, recv_sf,
                 recv_topk_idx, recv_topk_weights,
                 copied_topk_idx,
