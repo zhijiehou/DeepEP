@@ -36,6 +36,8 @@ dispatch_impl(
     int* psum_num_recv_tokens_per_scaleup_rank,
     int* psum_num_recv_tokens_per_expert,
     int* dst_buffer_slot_idx,
+    void* expanded_area,
+    const int worst_case_tokens_per_expert,
     const int num_tokens,
     const int sf_token_stride, const int sf_hidden_stride,
     const ncclDevComm_t nccl_dev_comm, const ncclWindow_t nccl_window, void* buffer,
@@ -327,7 +329,7 @@ dispatch_impl(
             ptx::tma_store_fence();
             __syncwarp();
 
-            // Deduplicate ranks and assign slots
+            // Deduplicate ranks and assign slots (for metadata-only buffer PUT)
             int stored_dst_slot_idx = -1;
             if constexpr (kReuseSlotIndices) {
                 if (lane_idx < kNumTopk)
@@ -343,6 +345,21 @@ dispatch_impl(
                     dst_buffer_slot_idx[token_idx * kNumTopk + lane_idx] = value;
                 }
             }
+
+            // Phase 3: Per-expert expanded row allocation using worst-case static layout.
+            // expanded_area is partitioned as: expert_e starts at row e * worst_case_tokens_per_expert.
+            // local_offset = atomicAdd(local_per_expert_counter[e], 1) gives unique slot within expert.
+            // No dependency on psum or notify warp — fully local and parallel.
+            int stored_dst_expanded_row = -1;
+            if (lane_idx < kNumTopk and expanded_area != nullptr) {
+                const auto dst_expert_idx = tma_buffer.get_topk_idx_ptr()[lane_idx];
+                if (dst_expert_idx >= 0) {
+                    const auto local_expert_idx = dst_expert_idx % kNumExpertsPerRank;
+                    const auto local_offset = atomicAdd(
+                        workspace_layout.get_per_expert_counter() + local_expert_idx, 1);
+                    stored_dst_expanded_row = local_expert_idx * worst_case_tokens_per_expert + local_offset;
+                }
+            }
             __syncwarp();
 
             // Wait TMA load arrival
@@ -353,7 +370,7 @@ dispatch_impl(
             }
             __syncwarp();
 
-            // TMA store to send buffer
+            // TMA store to send buffer (metadata-only, for RDMA path)
             auto send_buffer_ptr = send_buffer.get_token_buffer(token_idx).get_base_ptr();
             if constexpr (not kIsScaleupNVLink) {
                 if (ptx::elect_one_sync())
@@ -362,7 +379,9 @@ dispatch_impl(
                 __syncwarp();
             }
 
-            // Issue TMA NVLink stores
+            // Phase 3: Issue TMA NVLink stores
+            // Path A (metadata → buffer slot): same as before, used by epilogue for sf/weights/src_info
+            // Path B (hidden → expanded_area[dst_row]): direct PUT, bypasses epilogue for hidden
             EP_STATIC_ASSERT(kNumTopk <= 32, "Invalid top-k selection");
             const auto dst_ptr = stored_dst_slot_idx >= 0 ?
                 gin.get_sym_ptr<team_t>(recv_buffer.get_token_buffer(stored_dst_slot_idx).get_base_ptr(), stored_dst_rank_idx) :
@@ -370,9 +389,29 @@ dispatch_impl(
             if (dst_ptr != nullptr)
                 ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
             ptx::tma_store_commit();
+
+            // Phase 3: PUT hidden directly to expanded_area[dst_expanded_row] for each (token, expert) pair
+            // This eliminates the epilogue TMA load/store of hidden entirely
+            if (lane_idx < kNumTopk and stored_dst_expanded_row >= 0 and expanded_area != nullptr) {
+                const auto dst_expert_idx = tma_buffer.get_topk_idx_ptr()[lane_idx];
+                const auto dst_rank_idx = dst_expert_idx / kNumExpertsPerRank;
+                // Target: peer rank's expanded_area[stored_dst_expanded_row * hidden_bytes]
+                auto* expanded_row_ptr = math::advance_ptr<uint8_t>(
+                    static_cast<uint8_t*>(expanded_area),
+                    static_cast<int64_t>(stored_dst_expanded_row) * kNumHiddenBytes);
+                const auto expanded_dst_ptr = gin.get_sym_ptr<team_t>(expanded_row_ptr, dst_rank_idx);
+                if (expanded_dst_ptr != nullptr) {
+                    // NVLink path: TMA store hidden directly to peer expanded_area slot
+                    ptx::tma_store_1d(expanded_dst_ptr, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+                } else if constexpr (not kIsScaleupNVLink) {
+                    // RDMA path: need a staging buffer, put directly
+                    gin.put<team_t>(expanded_row_ptr, tma_buffer.get_hidden_ptr(), kNumHiddenBytes, dst_rank_idx);
+                }
+            }
+            ptx::tma_store_commit();
             __syncwarp();
 
-            // Issue RDMA put
+            // Issue RDMA put (metadata only)
             if constexpr (not kIsScaleupNVLink) {
                 // Wait the send buffer store to arrive
                 ptx::tma_store_wait<1>();
@@ -396,10 +435,15 @@ dispatch_impl(
     // Trigger the copy epilogue kernel
     cudaTriggerProgrammaticLaunchCompletion();
 
-    // Clean atomic counters
+    // Clean atomic counters (both per-rank sender counters and per-expert expanded counters)
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
-    if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumRanks)
-        workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+    if (not kReuseSlotIndices and sm_idx == 0) {
+        if (thread_idx < kNumRanks)
+            workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+        // Phase 3: reset per_expert_counter for next call
+        if (thread_idx < kNumExpertsPerRank)
+            workspace_layout.get_per_expert_counter()[thread_idx] = 0;
+    }
 }
 
 }  // namespace deep_ep::elastic

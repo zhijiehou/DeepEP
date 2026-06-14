@@ -111,6 +111,8 @@ public:
         int* psum_num_recv_tokens_per_scaleup_rank;
         int* psum_num_recv_tokens_per_expert;
         int* dst_buffer_slot_idx;
+        void* expanded_area;
+        int worst_case_tokens_per_expert;
         int* token_metadata_at_forward;
         int num_tokens;
         int sf_token_stride, sf_hidden_stride;
@@ -173,6 +175,8 @@ static void __instantiate_kernel() {{
                 args.psum_num_recv_tokens_per_scaleup_rank,
                 args.psum_num_recv_tokens_per_expert,
                 args.dst_buffer_slot_idx,
+                args.expanded_area,
+                args.worst_case_tokens_per_expert,
                 args.num_tokens,
                 args.sf_token_stride, args.sf_hidden_stride,
                 args.nccl_dev_comm, args.nccl_window,
@@ -218,6 +222,8 @@ static void launch_dispatch(void* x, void* sf,
                             int* psum_num_recv_tokens_per_scaleup_rank,
                             int* psum_num_recv_tokens_per_expert,
                             int* dst_buffer_slot_idx,
+                            void* expanded_area,
+                            int worst_case_tokens_per_expert,
                             int* token_metadata_at_forward,
                             const int& num_tokens, const int& num_max_tokens_per_rank,
                             const int& hidden, const int& elem_size,
@@ -292,6 +298,8 @@ static void launch_dispatch(void* x, void* sf,
         .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
         .psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert,
         .dst_buffer_slot_idx = dst_buffer_slot_idx,
+        .expanded_area = expanded_area,
+        .worst_case_tokens_per_expert = worst_case_tokens_per_expert,
         .token_metadata_at_forward = token_metadata_at_forward,
         .num_tokens = num_tokens,
         .sf_token_stride = sf_token_stride, .sf_hidden_stride = sf_hidden_stride,
@@ -329,6 +337,7 @@ public:
         int num_recv_tokens;
         int recv_sf_token_stride, recv_sf_hidden_stride;
         int scaleout_rank_idx, scaleup_rank_idx;
+        int worst_case_tokens_per_expert;
 
         jit::LaunchArgs launch_args;
     };
@@ -361,7 +370,8 @@ static void __instantiate_kernel() {{
                                                  args.channel_linked_list,
                                                  args.num_recv_tokens,
                                                  args.recv_sf_token_stride, args.recv_sf_hidden_stride,
-                                                 args.scaleout_rank_idx, args.scaleup_rank_idx));
+                                                 args.scaleout_rank_idx, args.scaleup_rank_idx,
+                                                 args.worst_case_tokens_per_expert));
     }
 };
 
@@ -381,6 +391,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           const int& num_sms, const int& num_smem_bytes,
                                           const int& num_channels,
                                           const bool& do_expand, const bool& cached_mode,
+                                          const int& worst_case_tokens_per_expert,
                                           const at::cuda::CUDAStream& stream) {
     // Maximize shared memory utilization
     const auto token_layout = layout::TokenLayout(num_hidden_bytes, num_sf_packs * sizeof(sf_pack_t), num_topk, true);
@@ -405,6 +416,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .num_recv_tokens = num_recv_tokens,
         .recv_sf_token_stride = recv_sf_token_stride, .recv_sf_hidden_stride = recv_sf_hidden_stride,
         .scaleout_rank_idx = scaleout_rank_idx, .scaleup_rank_idx = scaleup_rank_idx,
+        .worst_case_tokens_per_expert = worst_case_tokens_per_expert,
         .launch_args = jit::LaunchArgs(num_sms, num_threads, num_smem_bytes, 1, false, true)};
     const auto code = DispatchCopyEpilogueRuntime::generate(args);
     const auto runtime = jit::compiler->build("dispatch_copy_epilogue", code);

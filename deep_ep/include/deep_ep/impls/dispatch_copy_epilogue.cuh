@@ -29,7 +29,8 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             int* channel_linked_list,
                             int num_recv_tokens,
                             const int recv_sf_token_stride, const int recv_sf_hidden_stride,
-                            const int scaleout_rank_idx, const int scaleup_rank_idx) {
+                            const int scaleout_rank_idx, const int scaleup_rank_idx,
+                            const int worst_case_tokens_per_expert) {
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x), thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
@@ -84,11 +85,22 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         __syncwarp();
 
         // Issue TMA loads
-        // Including all stuffs: data, SF, top-k metadata
+        // Phase 3: when recv_x == nullptr, dispatch warp already PUT hidden to expanded_area directly.
+        // Only load metadata (SF + topk meta), skip hidden to reduce TMA tx bytes.
+        const auto tma_load_bytes = (recv_x != nullptr)
+            ? tma_buffer.get_num_bytes<false>()
+            : (tma_buffer.get_num_bytes<false>() - kNumHiddenBytes);
         if (ptx::elect_one_sync()) {
-            ptx::tma_load_1d(tma_buffer.get_base_ptr(), buffer_token.get_base_ptr(),
-                             mbarrier_ptr, tma_buffer.get_num_bytes<false>());
-            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, tma_buffer.get_num_bytes<false>());
+            if (recv_x != nullptr) {
+                ptx::tma_load_1d(tma_buffer.get_base_ptr(), buffer_token.get_base_ptr(),
+                                 mbarrier_ptr, tma_load_bytes);
+            } else {
+                // Skip hidden: load from sf offset (after hidden region)
+                ptx::tma_load_1d(tma_buffer.get_sf_ptr(),
+                                 math::advance_ptr<uint8_t>(buffer_token.get_base_ptr(), kNumHiddenBytes),
+                                 mbarrier_ptr, tma_load_bytes);
+            }
+            ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, tma_load_bytes);
         }
         __syncwarp();
 
@@ -109,11 +121,21 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         __syncwarp();
 
         // Calculate target indices in the tensor
+        // Phase 3: when recv_x == nullptr, use worst-case static layout (expert_e * worst_case + offset)
+        // so sf/weights/src_metadata align with the hidden rows that dispatch warp already wrote.
+        // When recv_x != nullptr (Phase 2 fallback), use psum atomicAdd as before.
         int dst_tensor_idx = -1;
         if (not kDoExpand and ptx::elect_one_sync()) {
             dst_tensor_idx = i;
         } else if (kDoExpand and dst_expert_idx >= 0) {
-            dst_tensor_idx = atomicAdd(psum_num_recv_tokens_per_expert + dst_expert_idx, 1);
+            if (recv_x == nullptr) {
+                // Phase 3: static worst-case layout
+                dst_tensor_idx = dst_expert_idx * worst_case_tokens_per_expert
+                    + atomicAdd(psum_num_recv_tokens_per_expert + dst_expert_idx, 1);
+            } else {
+                // Phase 2: compact psum layout
+                dst_tensor_idx = atomicAdd(psum_num_recv_tokens_per_expert + dst_expert_idx, 1);
+            }
         }
         __syncwarp();
 
@@ -129,8 +151,9 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
             __syncwarp();
         }
 
-        // Issue TMA stores for data
-        if (kDoExpand ? (dst_tensor_idx >= 0) : ptx::elect_one_sync()) {
+        // Issue TMA stores for hidden data
+        // Phase 3: skip if recv_x == nullptr (dispatch warp already PUT hidden to expanded_area)
+        if (recv_x != nullptr and (kDoExpand ? (dst_tensor_idx >= 0) : ptx::elect_one_sync())) {
             ptx::tma_store_1d(math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes),
                               tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
             ptx::tma_store_commit();

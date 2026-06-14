@@ -1307,7 +1307,19 @@ public:
         std::fill_n(host_workspace_layout.get_scaleup_expert_count_ptr<false>(), num_local_experts, 0);
         std::atomic_thread_fence(std::memory_order_seq_cst);
 
-        // Do dispatch into the buffers
+        // Phase 3: compute worst_case_tokens_per_expert for expanded_area layout
+        // Each expert occupies a fixed contiguous block of rows; dispatch warp writes directly
+        // to expanded_area[expert_e * worst_case + local_offset] without needing psum.
+        const int worst_case_tokens_per_expert = math::align(
+            nccl_context->num_ranks * num_max_tokens_per_rank * std::min(num_topk, num_local_experts),
+            expert_alignment);
+        const int num_expanded_tokens = worst_case_tokens_per_expert * num_local_experts;
+        const auto expanded_area_bytes = num_buffer_bytes - static_cast<int64_t>(dispatch_buf_size);
+        const auto required_bytes = static_cast<int64_t>(num_expanded_tokens) * hidden * static_cast<int64_t>(x.element_size());
+        EP_HOST_ASSERT(expanded_area_bytes >= required_bytes);
+        uint8_t* expanded_area_ptr = static_cast<uint8_t*>(static_cast<void*>(buffer)) + dispatch_buf_size;
+
+        // Do dispatch into the buffers (Phase 3: also PUT hidden directly to expanded_area)
         EP_HOST_ASSERT(num_sms <= jit::device_runtime->get_num_sms());
         launch_dispatch(x.data_ptr(), sf_ptr,
                         topk_idx.data_ptr<topk_idx_t>(), topk_weights_ptr,
@@ -1316,6 +1328,8 @@ public:
                         psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                         psum_num_recv_tokens_per_expert.data_ptr<int>(),
                         dst_buffer_slot_idx.data_ptr<int>(),
+                        expanded_area_ptr,
+                        worst_case_tokens_per_expert,
                         token_metadata_at_forward_ptr,
                         num_tokens, num_max_tokens_per_rank,
                         hidden, x.element_size(),
@@ -1333,27 +1347,10 @@ public:
                         cached_mode, deterministic, do_cpu_sync,
                         comm_stream);
 
-        // Without CPU sync: allocate with worst-case expanded token count
-        const int num_expanded_tokens_worst = nccl_context->num_ranks * num_max_tokens_per_rank * std::min(num_topk, num_local_experts)
-            + (expert_alignment - 1) * num_local_experts;
-        const int num_expanded_tokens = math::align(num_expanded_tokens_worst, expert_alignment);
-        const std::vector<int> num_recv_tokens_per_expert_list;  // empty in async path
-
-        // --- Key difference from dispatch(): recv_x is backed by sym-mem expanded area ---
-        // The expanded area sits right after the dispatch buffer region (which is idle after epilogue).
-        // We verify it can hold num_expanded_tokens rows of hidden, then wrap it as a torch tensor.
-        const auto expanded_area_bytes = num_buffer_bytes - static_cast<int64_t>(dispatch_buf_size);
-        const auto required_bytes = static_cast<int64_t>(num_expanded_tokens) * hidden * static_cast<int64_t>(x.element_size());
-        EP_HOST_ASSERT(expanded_area_bytes >= required_bytes);
-        uint8_t* expanded_area_ptr = static_cast<uint8_t*>(static_cast<void*>(buffer)) + dispatch_buf_size;
-
-        // recv_x_sym: sym-mem view of expanded area (zero-copy handle for downstream use)
+        // Phase 3: recv_x and recv_x_sym both point to expanded_area.
+        // hidden is already written by dispatch warp directly; no verify copy needed.
         auto recv_x_sym = torch::from_blob(expanded_area_ptr, {num_expanded_tokens, hidden}, x.options());
-        // recv_x: when do_verify_copy=true, a normal GPU tensor filled via cudaMemcpyAsync after epilogue;
-        //         otherwise same sym-mem view (zero overhead in production)
-        auto recv_x = do_verify_copy
-            ? torch::empty({num_expanded_tokens, hidden}, x.options())
-            : torch::from_blob(expanded_area_ptr, {num_expanded_tokens, hidden}, x.options());
+        auto recv_x = recv_x_sym;
 
         // Optional output tensors (same as dispatch, do_expand=true path)
         auto recv_sf = std::optional<torch::Tensor>();
@@ -1391,12 +1388,14 @@ public:
         // num_recv_tokens for epilogue = worst-case non-expanded recv count
         const int num_recv_tokens = num_max_tokens_per_rank * nccl_context->num_ranks;
 
-        // Launch epilogue: writes hidden directly into expanded_area_ptr (sym-mem)
+        // Phase 3: epilogue no longer writes hidden (dispatch warp already PUT it directly to expanded_area)
+        // Pass nullptr for recv_x to skip hidden TMA load/store in epilogue kernel.
+        // Epilogue still handles: sf, topk_weights, recv_src_metadata.
         stream_control_before_epilogue(previous_event_before_epilogue);
         launch_dispatch_copy_epilogue(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                                      expanded_area_ptr, recv_sf_ptr,
+                                      nullptr, recv_sf_ptr,
                                       nullptr, recv_topk_weights_ptr,
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
@@ -1410,6 +1409,7 @@ public:
                                       jit::device_runtime->get_num_smem_bytes(),
                                       num_channels,
                                       do_expand, cached_mode,
+                                      worst_case_tokens_per_expert,
                                       comm_stream);
 
         // If verify copy is requested, copy expanded area → recv_x on the same comm_stream

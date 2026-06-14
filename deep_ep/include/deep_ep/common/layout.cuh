@@ -76,6 +76,10 @@ struct WorkspaceLayout {
         // AGRS signals
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
+        // Phase 3: per-expert atomic counter for direct expanded PUT
+        // Dispatch warp uses this to compute expanded row index without going through epilogue
+        num_bytes += kNumMaxExperts * sizeof(int);
+
         // Ensure LDG.256 work
         return math::align<int64_t>(num_bytes, 32);
     }
@@ -174,6 +178,14 @@ struct WorkspaceLayout {
         const auto base_ptr = math::advance_ptr<int>(
             get_agrs_recv_signal_ptr(0, 0), kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+
+    // Phase 3: per-expert counter for dispatch-side expanded row allocation
+    // Each expert slot stores the number of tokens dispatched so far to that expert on this rank
+    __forceinline__ __device__ __host__ int* get_per_expert_counter() const {
+        const auto base_ptr = math::advance_ptr<int>(
+            get_agrs_session_signal_ptr(0), kNumMaxRanks * sizeof(int));
+        return base_ptr;
     }
 };
 
