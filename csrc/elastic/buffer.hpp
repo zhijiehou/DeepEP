@@ -1401,6 +1401,9 @@ public:
         // Prefix sum for expand mode: slice exclusive part for atomic additions
         psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert.slice(0, 0, num_local_experts);
         EP_HOST_ASSERT(psum_num_recv_tokens_per_expert.size(0) == num_local_experts);
+        // Phase 3: epilogue uses psum_num_recv_tokens_per_expert for atomicAdd to compute dst_tensor_idx.
+        // Must be zero-initialized before launch so dispatch warp and epilogue row allocation match.
+        psum_num_recv_tokens_per_expert.zero_();
 
         // num_recv_tokens for epilogue = worst-case non-expanded recv count
         const int num_recv_tokens = num_max_tokens_per_rank * nccl_context->num_ranks;
