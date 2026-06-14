@@ -390,31 +390,34 @@ dispatch_impl(
                 ptx::tma_store_1d(dst_ptr, tma_buffer.get_base_ptr(), tma_buffer.get_num_bytes<false>());
             ptx::tma_store_commit();
 
-            // Phase 3: PUT hidden directly to expanded_area[dst_expanded_row] for each (token, expert) pair
-            // This eliminates the epilogue TMA load/store of hidden entirely
-            if (lane_idx < kNumTopk and stored_dst_expanded_row >= 0 and expanded_area != nullptr) {
-                const auto dst_expert_idx = tma_buffer.get_topk_idx_ptr()[lane_idx];
-                const auto dst_rank_idx = dst_expert_idx / kNumExpertsPerRank;
-                // Target: peer rank's expanded_area[stored_dst_expanded_row * hidden_bytes]
-                auto* expanded_row_ptr = math::advance_ptr<uint8_t>(
-                    static_cast<uint8_t*>(expanded_area),
-                    static_cast<int64_t>(stored_dst_expanded_row) * kNumHiddenBytes);
-                const auto expanded_dst_ptr = gin.get_sym_ptr<team_t>(expanded_row_ptr, dst_rank_idx);
-                if (expanded_dst_ptr != nullptr) {
-                    // NVLink path: TMA store hidden directly to peer expanded_area slot
-                    ptx::tma_store_1d(expanded_dst_ptr, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
-                } else if constexpr (not kIsScaleupNVLink) {
-                    // RDMA path: need a staging buffer, put directly
-                    gin.put<team_t>(expanded_row_ptr, tma_buffer.get_hidden_ptr(), kNumHiddenBytes, dst_rank_idx);
+            // Phase 3: PUT hidden directly to expanded_area for each (token, expert) pair.
+            // Each topk lane independently computes its dst_row and issues a PUT.
+            // TMA requires elect_one_sync — we serialize across topk lanes using a loop on lane 0.
+            // For kNumTopk lanes, lane 0 iterates through each topk and does one TMA per iteration.
+            if (ptx::elect_one_sync() and expanded_area != nullptr) {
+                for (int k = 0; k < kNumTopk; ++k) {
+                    // Broadcast stored_dst_expanded_row and dst_expert_idx from lane k
+                    const int row = ptx::exchange(stored_dst_expanded_row, k);
+                    const int expert_idx = tma_buffer.get_topk_idx_ptr()[k];
+                    if (row >= 0 and expert_idx >= 0) {
+                        const auto dst_rank_idx = expert_idx / kNumExpertsPerRank;
+                        auto* expanded_row_ptr = math::advance_ptr<uint8_t>(
+                            static_cast<uint8_t*>(expanded_area),
+                            static_cast<int64_t>(row) * kNumHiddenBytes);
+                        const auto expanded_dst_ptr = gin.get_sym_ptr<team_t>(expanded_row_ptr, dst_rank_idx);
+                        if (expanded_dst_ptr != nullptr) {
+                            ptx::tma_store_1d(expanded_dst_ptr, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+                            ptx::tma_store_commit();
+                        }
+                    }
                 }
             }
-            ptx::tma_store_commit();
             __syncwarp();
 
             // Issue RDMA put (metadata only)
             if constexpr (not kIsScaleupNVLink) {
-                // Wait the send buffer store to arrive
-                ptx::tma_store_wait<1>();
+                // Wait all pending TMA stores to complete (metadata slot + hidden PUTs)
+                ptx::tma_store_wait<0>();
                 __syncwarp();
 
                 // NOTES: we should skip the NVLink accessible ranks
