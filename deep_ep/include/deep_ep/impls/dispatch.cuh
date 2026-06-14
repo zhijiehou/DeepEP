@@ -387,8 +387,8 @@ dispatch_impl(
 
             // Issue RDMA put (metadata only)
             if constexpr (not kIsScaleupNVLink) {
-                // Wait all pending TMA stores to complete (metadata slot + hidden PUTs)
-                ptx::tma_store_wait<0>();
+                // Wait the send buffer store to arrive
+                ptx::tma_store_wait<1>();
                 __syncwarp();
 
                 // NOTES: we should skip the NVLink accessible ranks
@@ -411,13 +411,10 @@ dispatch_impl(
 
     // Clean atomic counters (both per-rank sender counters and per-expert expanded counters)
     EP_STATIC_ASSERT(kNumRanks <= kNumThreads, "Insufficient threads");
-    if (not kReuseSlotIndices and sm_idx == 0) {
-        if (thread_idx < kNumRanks)
-            workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
-        // Phase 3: reset per_expert_counter for next call
-        if (thread_idx < kNumExpertsPerRank)
-            workspace_layout.get_per_expert_counter()[thread_idx] = 0;
-    }
+    if (not kReuseSlotIndices and sm_idx == 0 and thread_idx < kNumRanks)
+        workspace_layout.get_scaleup_atomic_sender_counter()[thread_idx] = 0;
+    // Phase 3: per_expert_counter reset deferred to dispatch_to_expanded path only
+    // (avoid touching workspace after cudaTriggerProgrammaticLaunchCompletion in base dispatch path)
 }
 
 }  // namespace deep_ep::elastic
