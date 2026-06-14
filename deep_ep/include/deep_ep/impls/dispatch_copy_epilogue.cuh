@@ -23,7 +23,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 dispatch_copy_epilogue_impl(void* buffer, void* workspace,
                             int* psum_num_recv_tokens_per_scaleup_rank,
                             int* psum_num_recv_tokens_per_expert,
-                            void* recv_x, sf_pack_t* recv_sf,
+                            void* recv_x, void* expanded_area,
+                            sf_pack_t* recv_sf,
                             topk_idx_t* recv_topk_idx, float* recv_topk_weights,
                             int* recv_src_metadata,
                             int* channel_linked_list,
@@ -84,22 +85,11 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         ptx::tma_store_wait();
         __syncwarp();
 
-        // Issue TMA loads
-        // Phase 3: when recv_x == nullptr, dispatch warp already PUT hidden to expanded_area directly.
-        // Only load metadata (SF + topk meta), skip hidden to reduce TMA tx bytes.
-        const auto tma_load_bytes = (recv_x != nullptr)
-            ? tma_buffer.get_num_bytes<false>()
-            : (tma_buffer.get_num_bytes<false>() - kNumHiddenBytes);
+        // Issue TMA loads (always load full token including hidden)
+        const auto tma_load_bytes = tma_buffer.get_num_bytes<false>();
         if (ptx::elect_one_sync()) {
-            if (recv_x != nullptr) {
-                ptx::tma_load_1d(tma_buffer.get_base_ptr(), buffer_token.get_base_ptr(),
-                                 mbarrier_ptr, tma_load_bytes);
-            } else {
-                // Skip hidden: load from sf offset (after hidden region)
-                ptx::tma_load_1d(tma_buffer.get_sf_ptr(),
-                                 math::advance_ptr<uint8_t>(buffer_token.get_base_ptr(), kNumHiddenBytes),
-                                 mbarrier_ptr, tma_load_bytes);
-            }
+            ptx::tma_load_1d(tma_buffer.get_base_ptr(), buffer_token.get_base_ptr(),
+                             mbarrier_ptr, tma_load_bytes);
             ptx::mbarrier_arrive_and_set_tx(mbarrier_ptr, tma_load_bytes);
         }
         __syncwarp();
@@ -121,15 +111,16 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         __syncwarp();
 
         // Calculate target indices in the tensor
-        // Phase 3: when recv_x == nullptr, use worst-case static layout (expert_e * worst_case + offset)
-        // so sf/weights/src_metadata align with the hidden rows that dispatch warp already wrote.
-        // When recv_x != nullptr (Phase 2 fallback), use psum atomicAdd as before.
+        // Phase 3 (recv_x == nullptr): write hidden to expanded_area with worst-case static layout.
+        //   dst_tensor_idx = expert_e * worst_case + atomicAdd(psum_num_recv_tokens_per_expert, 1)
+        //   The actual write target is expanded_area; recv_src_metadata records this same idx.
+        // Phase 2 fallback (recv_x != nullptr): compact psum layout into recv_x.
         int dst_tensor_idx = -1;
         if (not kDoExpand and ptx::elect_one_sync()) {
             dst_tensor_idx = i;
         } else if (kDoExpand and dst_expert_idx >= 0) {
             if (recv_x == nullptr) {
-                // Phase 3: static worst-case layout
+                // Phase 3: worst-case static layout into expanded_area
                 dst_tensor_idx = dst_expert_idx * worst_case_tokens_per_expert
                     + atomicAdd(psum_num_recv_tokens_per_expert + dst_expert_idx, 1);
             } else {
@@ -152,8 +143,15 @@ dispatch_copy_epilogue_impl(void* buffer, void* workspace,
         }
 
         // Issue TMA stores for hidden data
-        // Phase 3: skip if recv_x == nullptr (dispatch warp already PUT hidden to expanded_area)
-        if (recv_x != nullptr and (kDoExpand ? (dst_tensor_idx >= 0) : ptx::elect_one_sync())) {
+        // Phase 3 (expanded_area != nullptr): write hidden to expanded_area[dst_tensor_idx]
+        // Phase 2 (recv_x != nullptr): write hidden to recv_x[dst_tensor_idx]
+        if (kDoExpand and dst_tensor_idx >= 0) {
+            void* hidden_dst = (expanded_area != nullptr)
+                ? math::advance_ptr(expanded_area, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes)
+                : math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes);
+            ptx::tma_store_1d(hidden_dst, tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
+            ptx::tma_store_commit();
+        } else if (not kDoExpand and ptx::elect_one_sync()) {
             ptx::tma_store_1d(math::advance_ptr(recv_x, static_cast<int64_t>(dst_tensor_idx) * kNumHiddenBytes),
                               tma_buffer.get_hidden_ptr(), kNumHiddenBytes);
             ptx::tma_store_commit();

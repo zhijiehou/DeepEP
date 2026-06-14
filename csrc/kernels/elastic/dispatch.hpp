@@ -332,7 +332,7 @@ public:
         void *buffer, *workspace;
         int* psum_num_recv_tokens_per_scaleup_rank;
         int* psum_num_recv_tokens_per_expert;
-        void* recv_x; void* recv_sf;
+        void* recv_x; void* expanded_area; void* recv_sf;
         topk_idx_t* recv_topk_idx; float* recv_topk_weights;
         int* recv_src_metadata;
         int* channel_linked_list;
@@ -367,7 +367,8 @@ static void __instantiate_kernel() {{
                                                  args.buffer, args.workspace,
                                                  args.psum_num_recv_tokens_per_scaleup_rank,
                                                  args.psum_num_recv_tokens_per_expert,
-                                                 args.recv_x, args.recv_sf, args.recv_topk_idx, args.recv_topk_weights,
+                                                 args.recv_x, args.expanded_area,
+                                                 args.recv_sf, args.recv_topk_idx, args.recv_topk_weights,
                                                  args.recv_src_metadata,
                                                  args.channel_linked_list,
                                                  args.num_recv_tokens,
@@ -380,7 +381,7 @@ static void __instantiate_kernel() {{
 static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
                                           int* psum_num_recv_tokens_per_scaleup_rank,
                                           int* psum_num_recv_tokens_per_expert,
-                                          void* recv_x, void* recv_sf,
+                                          void* recv_x, void* expanded_area, void* recv_sf,
                                           topk_idx_t* recv_topk_idx, float* recv_topk_weights,
                                           int* recv_src_metadata,
                                           int* channel_linked_list,
@@ -411,7 +412,7 @@ static void launch_dispatch_copy_epilogue(void* buffer, void* workspace,
         .buffer = buffer, .workspace = workspace,
         .psum_num_recv_tokens_per_scaleup_rank = psum_num_recv_tokens_per_scaleup_rank,
         .psum_num_recv_tokens_per_expert = psum_num_recv_tokens_per_expert,
-        .recv_x = recv_x, .recv_sf = recv_sf,
+        .recv_x = recv_x, .expanded_area = expanded_area, .recv_sf = recv_sf,
         .recv_topk_idx = recv_topk_idx, .recv_topk_weights = recv_topk_weights,
         .recv_src_metadata = recv_src_metadata,
         .channel_linked_list = channel_linked_list,

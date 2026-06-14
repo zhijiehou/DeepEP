@@ -1113,7 +1113,7 @@ public:
         launch_dispatch_copy_epilogue(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                                      recv_x.data_ptr(), recv_sf_ptr,
+                                      recv_x.data_ptr(), nullptr, recv_sf_ptr,
                                       recv_topk_idx_ptr, recv_topk_weights_ptr,
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
@@ -1408,14 +1408,14 @@ public:
         // num_recv_tokens for epilogue = worst-case non-expanded recv count
         const int num_recv_tokens = num_max_tokens_per_rank * nccl_context->num_ranks;
 
-        // Phase 3: epilogue no longer writes hidden (dispatch warp already PUT it directly to expanded_area)
-        // Pass nullptr for recv_x to skip hidden TMA load/store in epilogue kernel.
-        // Epilogue still handles: sf, topk_weights, recv_src_metadata.
+        // Phase 3: epilogue writes hidden to expanded_area (not recv_x).
+        // Pass recv_x=nullptr and expanded_area=expanded_area_ptr.
+        // Epilogue handles: hidden → expanded_area, sf, topk_weights, recv_src_metadata.
         stream_control_before_epilogue(previous_event_before_epilogue);
         launch_dispatch_copy_epilogue(buffer, workspace,
                                       psum_num_recv_tokens_per_scaleup_rank.data_ptr<int>(),
                                       psum_num_recv_tokens_per_expert.data_ptr<int>(),
-                                      nullptr, recv_sf_ptr,
+                                      nullptr, expanded_area_ptr, recv_sf_ptr,
                                       nullptr, recv_topk_weights_ptr,
                                       recv_src_metadata.data_ptr<int>(),
                                       channel_linked_list_ptr,
