@@ -1360,7 +1360,7 @@ public:
         auto recv_topk_idx = std::optional<torch::Tensor>();  // always null in expand mode
         auto recv_topk_weights = std::optional<torch::Tensor>();
         auto recv_src_metadata = torch::empty(
-            {num_expanded_tokens, num_topk + 2},
+            {num_recv_tokens, num_topk + 2},
             torch::TensorOptions(torch::kCUDA).dtype(torch::kInt));
 
         void* recv_sf_ptr = nullptr;
