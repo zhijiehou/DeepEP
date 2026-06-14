@@ -192,6 +192,8 @@ static void __instantiate_kernel() {{
                 args.psum_num_recv_tokens_per_scaleup_rank,
                 args.psum_num_recv_tokens_per_expert,
                 args.dst_buffer_slot_idx,
+                args.expanded_area,
+                args.worst_case_tokens_per_expert,
                 args.token_metadata_at_forward,
                 args.num_tokens,
                 args.sf_token_stride, args.sf_hidden_stride,
