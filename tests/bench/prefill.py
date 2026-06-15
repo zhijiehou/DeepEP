@@ -7,6 +7,7 @@ from deep_ep import ElasticBuffer
 from deep_ep.utils.envs import init_dist
 from deep_ep.utils.testing import bench
 from deep_ep.utils.math import per_token_cast_to_fp8
+from deep_ep.utils.refs import generate_pre_combine_data, ordered_accumulate, combine as ref_combine
 import os
 
 os.environ['EP_DISABLE_GIN'] = '1'
@@ -121,36 +122,40 @@ def bench_elastic_expand(group, num_tokens, hidden, num_topk, num_experts):
 
 
 def verify_correctness(group, num_ranks, num_tokens, hidden, num_topk, num_experts, local_rank):
-    """以 Legacy combine 结果为基准，验证 Elastic 各模式 combine 输出一致性。"""
+    """参考官方 refs 构造 combine 输入，验证 Elastic 各模式 combine 输出一致性。"""
     x_fp8, topk_idx, topk_weights = generate_inputs(num_tokens, hidden, num_topk, num_experts)
 
-    # --- Legacy ---
-    deep_ep.Buffer.set_num_sms(24)
-    buffer = deep_ep.Buffer(group, int(2e9), 0, low_latency_mode=False,
-                            num_qps_per_rank=1, explicitly_destroy=True)
-    num_tokens_per_rank, _, num_tokens_per_expert, is_token_in_rank, _ = \
-        buffer.get_dispatch_layout(topk_idx, num_experts)
-    default_config = deep_ep.Buffer.get_dispatch_config(num_ranks)
-    recv_x, _, _, _, handle, _ = buffer.dispatch(
-        x=x_fp8, num_tokens_per_rank=num_tokens_per_rank,
-        is_token_in_rank=is_token_in_rank, num_tokens_per_expert=num_tokens_per_expert,
-        topk_idx=topk_idx, topk_weights=topk_weights, config=default_config)
-    recv_bf16 = recv_x[0].to(torch.bfloat16) if isinstance(recv_x, tuple) \
-        else recv_x.to(torch.bfloat16)
-    combine_config = deep_ep.Buffer.get_combine_config(num_ranks)
-    legacy_out, _, _ = buffer.combine(x=recv_bf16, handle=handle, config=combine_config)
-    buffer.destroy()
+    rank = dist.get_rank()
+    ref_y = generate_pre_combine_data(
+        rank * num_tokens + torch.arange(num_tokens, device='cuda'),
+        num_tokens, num_topk, hidden)
+    ref_y[topk_idx == -1] = 0
+    ref_out = ref_combine(
+        ref_y, topk_idx,
+        1, num_ranks, num_experts,
+        None,
+        True, False)
+
+    def primary_rows(tensor_or_tuple):
+        return tensor_or_tuple[0].shape[0] if isinstance(tensor_or_tuple, tuple) else tensor_or_tuple.shape[0]
 
     # --- Elastic no-expand ---
     ebuf = ElasticBuffer(group=group, num_max_tokens_per_rank=num_tokens,
                          hidden=hidden, num_topk=num_topk,
                          use_fp8_dispatch=True, allow_hybrid_mode=False,
                          explicitly_destroy=True)
-    recv, _, _, handle, _ = ebuf.dispatch(x=x_fp8, topk_idx=topk_idx, topk_weights=topk_weights,
-                                          num_experts=num_experts, num_sms=24,
-                                          do_expand=False, do_cpu_sync=True)
-    recv_bf16 = recv[0].to(torch.bfloat16) if isinstance(recv, tuple) else recv.to(torch.bfloat16)
-    no_expand_out, _, _ = ebuf.combine(x=recv_bf16, handle=handle, topk_weights=None, num_sms=24)
+    recv, recv_topk_idx, recv_topk_weights, handle, _ = ebuf.dispatch(
+        x=x_fp8, topk_idx=topk_idx, topk_weights=topk_weights,
+        num_experts=num_experts, num_sms=24,
+        do_expand=False, do_cpu_sync=True)
+    num_recv_tokens = handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
+    src_token_global_idx = handle.recv_src_metadata[:num_recv_tokens, 0]
+    local_y = generate_pre_combine_data(src_token_global_idx, num_tokens, num_topk, hidden)
+    local_y[recv_topk_idx[:num_recv_tokens] == -1] = 0
+    input_for_combine = torch.empty((primary_rows(recv), hidden), dtype=torch.bfloat16, device='cuda')
+    input_for_combine[:num_recv_tokens] = ordered_accumulate(local_y)
+    no_expand_out, _, _ = ebuf.combine(
+        x=input_for_combine, handle=handle, topk_weights=recv_topk_weights, num_sms=24)
     ebuf.destroy()
 
     # --- Elastic expand ---
@@ -158,21 +163,32 @@ def verify_correctness(group, num_ranks, num_tokens, hidden, num_topk, num_exper
                          hidden=hidden, num_topk=num_topk,
                          use_fp8_dispatch=True, allow_hybrid_mode=False,
                          explicitly_destroy=True)
-    recv, _, _, handle, _ = ebuf.dispatch(x=x_fp8, topk_idx=topk_idx, topk_weights=topk_weights,
-                                          num_experts=num_experts, num_sms=24,
-                                          do_expand=True, do_cpu_sync=True)
-    recv_bf16 = recv[0].to(torch.bfloat16) if isinstance(recv, tuple) else recv.to(torch.bfloat16)
-    expand_out, _, _ = ebuf.combine(x=recv_bf16, handle=handle, topk_weights=None, num_sms=24)
+    recv, _, _, handle, _ = ebuf.dispatch(
+        x=x_fp8, topk_idx=topk_idx, topk_weights=topk_weights,
+        num_experts=num_experts, num_sms=24,
+        do_expand=True, do_cpu_sync=True)
+    num_recv_tokens = handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
+    src_token_global_idx = handle.recv_src_metadata[:num_recv_tokens, 0]
+    local_y = generate_pre_combine_data(src_token_global_idx, num_tokens, num_topk, hidden)
+    input_for_expand_combine = torch.empty((primary_rows(recv) + 1, hidden), dtype=torch.bfloat16, device='cuda')
+    input_for_expand_combine[handle.recv_src_metadata[:num_recv_tokens, 2:].flatten()] = local_y.view(-1, hidden)
+    input_for_expand_combine = input_for_expand_combine[:-1, ...]
+    expand_out, _, _ = ebuf.combine(x=input_for_expand_combine, handle=handle, topk_weights=None, num_sms=24)
     ebuf.destroy()
 
     # --- 对比（fp8 有精度损失，用较宽松的 atol） ---
-    ok_no_expand = torch.allclose(legacy_out.float(), no_expand_out.float(), atol=0.1, rtol=0.0)
-    ok_expand    = torch.allclose(legacy_out.float(), expand_out.float(),    atol=0.1, rtol=0.0)
+    ok_no_expand = torch.allclose(ref_out.float(), no_expand_out.float(), atol=0.1, rtol=0.0)
+    ok_expand    = torch.allclose(ref_out.float(), expand_out.float(),    atol=0.1, rtol=0.0)
 
     if local_rank == 0:
+        diff_no_expand = (ref_out.float() - no_expand_out.float()).abs().max().item()
+        diff_expand = (ref_out.float() - expand_out.float()).abs().max().item()
         status_no_expand = 'PASS' if ok_no_expand else 'FAIL'
         status_expand    = 'PASS' if ok_expand    else 'FAIL'
-        print(f'[verify tokens={num_tokens}] E-no-expand: {status_no_expand} | E-expand: {status_expand}', flush=True)
+        print(f'[verify tokens={num_tokens}] '
+              f'E-no-expand: {status_no_expand} (max_diff={diff_no_expand:.6f}) | '
+              f'E-expand: {status_expand} (max_diff={diff_expand:.6f})',
+              flush=True)
 
 
 def test(local_rank, num_local_ranks):
