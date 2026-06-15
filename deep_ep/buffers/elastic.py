@@ -137,7 +137,9 @@ class ElasticBuffer:
                  sl_idx: int = 3,
                  num_allocated_qps: int = 0,
                  num_cpu_timeout_secs: int = 300, num_gpu_timeout_secs: int = 100,
-                 explicitly_destroy: bool = False):
+                 explicitly_destroy: bool = False,
+                 static_expanded_num_experts: int = 0,
+                 static_expanded_expert_alignment: int = 1):
         """
         Initialize the elastic communication buffer.
 
@@ -158,6 +160,9 @@ class ElasticBuffer:
             num_gpu_timeout_secs: GPU-side timeout in seconds for GPU operations.
             explicitly_destroy: If this flag is set to True, you need to explicitly call `destroy()` to release resources;
                 otherwise, the resources will be released by the destructor.
+            static_expanded_num_experts: if non-zero, additionally size the buffer for
+                `dispatch_to_static_expanded` with this total number of experts.
+            static_expanded_expert_alignment: expert alignment used when sizing the static expanded layout.
         """
         # Some useful utilities
         self.group = group
@@ -175,12 +180,21 @@ class ElasticBuffer:
                 self.nccl_comm_handle.get(),
                 num_max_tokens_per_rank, hidden, num_topk, use_fp8_dispatch,
                 allow_hybrid_mode, allow_multiple_reduction)
+            if static_expanded_num_experts > 0:
+                static_expanded_num_bytes = _C.calculate_static_expanded_elastic_buffer_size(
+                    self.nccl_comm_handle.get(),
+                    num_max_tokens_per_rank, hidden, num_topk,
+                    static_expanded_num_experts, static_expanded_expert_alignment,
+                    use_fp8_dispatch, allow_hybrid_mode, allow_multiple_reduction)
+                num_bytes = max(num_bytes, static_expanded_num_bytes)
         if os.environ.get('EP_BUFFER_DEBUG', 0):
             print(f'Initializing EP elastic buffer with {num_bytes} bytes at rank EP {group.rank()}/{group.size()}')
         self.num_bytes = num_bytes
 
         # Store default values
         self.num_max_tokens_per_rank = num_max_tokens_per_rank
+        self.static_expanded_num_experts = static_expanded_num_experts
+        self.static_expanded_expert_alignment = static_expanded_expert_alignment
 
         # Check PCIe GPUs
         check_nvlink_connections(group)
@@ -808,6 +822,92 @@ class ElasticBuffer:
 
         # Return
         return recv_x, recv_topk_idx, recv_topk_weights, handle, EventOverlap(event)
+
+    def dispatch_to_static_expanded(self,
+                                    x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                                    topk_idx: torch.Tensor,
+                                    topk_weights: Optional[torch.Tensor] = None,
+                                    cumulative_local_expert_recv_stats: Optional[torch.Tensor] = None,
+                                    num_experts: Optional[int] = None,
+                                    num_max_tokens_per_rank: Optional[int] = None,
+                                    expert_alignment: Optional[int] = None,
+                                    num_sms: int = 0, num_qps: int = 0,
+                                    previous_event: Optional[EventHandle] = None,
+                                    previous_event_before_epilogue: Optional[EventHandle] = None,
+                                    async_with_compute_stream: bool = False,
+                                    allocate_on_comm_stream: bool = False,
+                                    do_handle_copy: bool = True,
+                                    do_cpu_sync: Optional[bool] = True,
+                                    use_tma_aligned_col_major_sf: bool = False) \
+            -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
+                     Optional[torch.Tensor], EPHandle, EventOverlap]:
+        """
+        NVLink-only static expanded dispatch.
+
+        This is a new opt-in API for fixed per-local-expert blocks and does not change
+        `dispatch(..., do_expand=True)`. Phase 0 exposes the API and sizing path; the
+        C++ runtime raises until the static-expanded kernel is implemented.
+        """
+        check_torch_deterministic()
+        assert self.num_scaleout_ranks == 1, 'dispatch_to_static_expanded is NVLink-only in v1'
+        assert self.num_scaleup_ranks == self.num_ranks, 'dispatch_to_static_expanded requires scale-up-only ranks'
+        assert num_experts is not None, '`num_experts` must be specified'
+
+        num_topk = topk_idx.shape[1]
+        num_sms = self.get_theoretical_num_sms(num_experts, num_topk) if num_sms == 0 else num_sms
+        num_qps = self.get_theoretical_num_qps(num_sms) if num_qps == 0 else num_qps
+        assert num_qps <= self.num_allocated_qps, f'Allocated QPs are not enough'
+
+        x, sf = x if isinstance(x, tuple) else (x, None)
+        num_max_tokens_per_rank = value_or(num_max_tokens_per_rank, self.num_max_tokens_per_rank)
+        expert_alignment = value_or(expert_alignment, self.static_expanded_expert_alignment)
+        do_cpu_sync = value_or(do_cpu_sync, True)
+
+        if self.static_expanded_num_experts > 0:
+            assert num_experts == self.static_expanded_num_experts, \
+                '`num_experts` must match static-expanded buffer sizing'
+        assert expert_alignment == self.static_expanded_expert_alignment, \
+            '`expert_alignment` must match static-expanded buffer sizing'
+
+        (recv_x, recv_sf,
+         recv_topk_weights,
+         cloned_topk_idx,
+         num_recv_tokens_per_expert_list,
+         psum_num_recv_tokens_per_scaleup_rank,
+         psum_num_recv_tokens_per_expert,
+         recv_src_metadata,
+         dst_buffer_slot_idx,
+         token_metadata_at_forward,
+         channel_linked_list,
+         event) = self.runtime.dispatch_to_static_expanded(
+            x, sf, topk_idx, topk_weights,
+            cumulative_local_expert_recv_stats,
+            num_max_tokens_per_rank,
+            num_experts, expert_alignment,
+            num_sms, num_qps,
+            previous_event,
+            previous_event_before_epilogue,
+            async_with_compute_stream, allocate_on_comm_stream,
+            do_handle_copy, do_cpu_sync,
+            use_tma_aligned_col_major_sf)
+
+        handle = EPHandle(True,
+                          num_experts, expert_alignment,
+                          num_max_tokens_per_rank,
+                          num_sms,
+                          cloned_topk_idx if do_handle_copy else topk_idx,
+                          num_recv_tokens_per_expert_list,
+                          psum_num_recv_tokens_per_scaleup_rank,
+                          psum_num_recv_tokens_per_expert,
+                          recv_src_metadata,
+                          dst_buffer_slot_idx,
+                          token_metadata_at_forward,
+                          channel_linked_list)
+        handle.static_expanded = True
+        handle.tokens_per_expert_capacity = align(self.num_ranks * num_max_tokens_per_rank, expert_alignment)
+
+        recv_x = (recv_x, recv_sf) if recv_sf is not None else recv_x
+        return recv_x, recv_topk_weights, handle, EventOverlap(event)
 
     @staticmethod
     def _unpack_bias(bias: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]) \

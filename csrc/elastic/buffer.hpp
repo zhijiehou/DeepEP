@@ -628,6 +628,73 @@ public:
         return std::max(num_dispatch_bytes, num_combine_bytes);
     }
 
+    static int64_t get_static_expanded_dispatch_buffer_size(const int64_t& nccl_comm,
+                                                            const int& num_max_tokens_per_rank,
+                                                            const int& hidden,
+                                                            int num_topk,
+                                                            const int& num_experts,
+                                                            const int& expert_alignment,
+                                                            const bool& use_fp8_dispatch,
+                                                            const bool& allow_hybrid_mode) {
+        EP_HOST_ASSERT(num_max_tokens_per_rank > 0 and hidden > 0);
+        EP_HOST_ASSERT(num_experts > 0 and expert_alignment > 0);
+
+        // NOTES: keep the metadata area as the current full dispatch buffer in Phase 0.
+        // Later phases can shrink it to a metadata-only layout without changing the API.
+        num_topk = num_topk == 0 ? 32 : num_topk;
+        const auto [num_rdma_ranks, num_nvl_ranks] = nccl::get_physical_domain_size(nccl_comm);
+        (void)num_rdma_ranks;
+        const auto [num_scaleout_ranks, num_scaleup_ranks] = nccl::get_logical_domain_size(nccl_comm, allow_hybrid_mode);
+        const auto is_scaleup_nvlink = num_scaleup_ranks == num_nvl_ranks;
+        const auto num_ranks = num_scaleout_ranks * num_scaleup_ranks;
+        EP_HOST_ASSERT(num_scaleout_ranks == 1 and is_scaleup_nvlink);
+        EP_HOST_ASSERT(num_experts % num_ranks == 0);
+
+        const auto elem_size = use_fp8_dispatch ? sizeof(__nv_fp8_e4m3) : sizeof(nv_bfloat16);
+        const auto num_sf_packs = use_fp8_dispatch ? math::ceil_div(hidden, 32) : 0;
+        const auto dispatch_metadata_bytes = get_dispatch_buffer_size(
+            num_max_tokens_per_rank, hidden, num_sf_packs, num_topk, elem_size,
+            num_scaleout_ranks, num_scaleup_ranks, is_scaleup_nvlink);
+
+        const auto num_local_experts = num_experts / num_ranks;
+        const auto tokens_per_expert_capacity =
+            math::align(num_ranks * num_max_tokens_per_rank, expert_alignment);
+        const auto expanded_rows =
+            static_cast<int64_t>(num_local_experts) * tokens_per_expert_capacity;
+
+        const auto expanded_x_bytes = math::align<int64_t>(
+            expanded_rows * hidden * elem_size, 256);
+        const auto expanded_sf_row_major_bytes = math::align<int64_t>(
+            expanded_rows * num_sf_packs * sizeof(sf_pack_t), 256);
+        const auto expanded_sf_tma_bytes = math::align<int64_t>(
+            math::align<int64_t>(expanded_rows, kNumAlignedSFPacks) *
+            num_sf_packs * sizeof(sf_pack_t), 256);
+        const auto expanded_sf_bytes = std::max(expanded_sf_row_major_bytes, expanded_sf_tma_bytes);
+        const auto per_expert_counter_bytes = math::align<int64_t>(
+            num_local_experts * sizeof(int), 256);
+
+        return math::align<int64_t>(dispatch_metadata_bytes, 256) +
+               expanded_x_bytes + expanded_sf_bytes + per_expert_counter_bytes;
+    }
+
+    static int64_t calculate_static_expanded_buffer_size(const int64_t& nccl_comm,
+                                                         const int& num_max_tokens_per_rank,
+                                                         const int& hidden,
+                                                         int num_topk,
+                                                         const int& num_experts,
+                                                         const int& expert_alignment,
+                                                         const bool& use_fp8_dispatch,
+                                                         const bool& allow_hybrid_mode,
+                                                         const bool& allow_multiple_reduction) {
+        const auto base_size = calculate_buffer_size(
+            nccl_comm, num_max_tokens_per_rank, hidden, num_topk,
+            use_fp8_dispatch, allow_hybrid_mode, allow_multiple_reduction);
+        const auto static_expanded_size = get_static_expanded_dispatch_buffer_size(
+            nccl_comm, num_max_tokens_per_rank, hidden, num_topk,
+            num_experts, expert_alignment, use_fp8_dispatch, allow_hybrid_mode);
+        return std::max(base_size, static_expanded_size);
+    }
+
     std::tuple<torch::Tensor, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>, std::optional<torch::Tensor>,
                std::optional<torch::Tensor>,
@@ -1107,6 +1174,36 @@ public:
                 event};
     }
 
+    pybind11::tuple dispatch_to_static_expanded(
+            const torch::Tensor& x,
+            const std::optional<torch::Tensor>& sf,
+            const torch::Tensor& topk_idx,
+            const std::optional<torch::Tensor>& topk_weights,
+            const std::optional<torch::Tensor>& cumulative_local_expert_recv_stats,
+            const int& num_max_tokens_per_rank,
+            const int& num_experts, const int& expert_alignment,
+            const int& num_sms, const int& num_qps,
+            const std::optional<EventHandle>& previous_event,
+            const std::optional<EventHandle>& previous_event_before_epilogue,
+            const bool& async_with_compute_stream,
+            const bool& allocate_on_comm_stream,
+            const bool& do_handle_copy, const bool& do_cpu_sync,
+            const bool& use_tma_aligned_col_major_sf) const {
+        (void)x; (void)sf; (void)topk_idx; (void)topk_weights;
+        (void)cumulative_local_expert_recv_stats;
+        (void)num_max_tokens_per_rank; (void)num_experts; (void)expert_alignment;
+        (void)num_sms; (void)num_qps;
+        (void)previous_event; (void)previous_event_before_epilogue;
+        (void)async_with_compute_stream; (void)allocate_on_comm_stream;
+        (void)do_handle_copy; (void)do_cpu_sync; (void)use_tma_aligned_col_major_sf;
+
+        EP_HOST_ASSERT(nccl_context->num_scaleout_ranks == 1);
+        EP_HOST_ASSERT(nccl_context->is_scaleup_nvlink);
+        EP_HOST_ASSERT(not deterministic);
+        EP_HOST_UNREACHABLE("dispatch_to_static_expanded is a Phase 0 API skeleton");
+        return pybind11::tuple();
+    }
+
     std::tuple<torch::Tensor, std::optional<torch::Tensor>, std::optional<EventHandle>>
     combine(const torch::Tensor& x,
             const std::optional<torch::Tensor>& topk_weights,
@@ -1291,8 +1388,10 @@ static void register_apis(pybind11::module_& m) {
         .def("agrs_get_inplace_tensor", &ElasticBuffer::agrs_get_inplace_tensor)
         .def("all_gather", &ElasticBuffer::all_gather)
         .def("dispatch", &ElasticBuffer::dispatch)
+        .def("dispatch_to_static_expanded", &ElasticBuffer::dispatch_to_static_expanded)
         .def("combine", &ElasticBuffer::combine);
     m.def("calculate_elastic_buffer_size", &ElasticBuffer::calculate_buffer_size);
+    m.def("calculate_static_expanded_elastic_buffer_size", &ElasticBuffer::calculate_static_expanded_buffer_size);
 
     // NCCL communicator handle
     m.def("get_local_nccl_unique_id", &nccl::get_local_unique_id);
